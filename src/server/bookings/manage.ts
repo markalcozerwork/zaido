@@ -21,9 +21,9 @@ import {
 import type { Row } from "../../db";
 import type { DbClient } from "../db-client";
 import type { BookingRow } from "./create";
-import type { ServerDeps } from "./deps";
+import type { ServerDeps } from "../deps";
 import { updateBooking } from "./payments";
-import { callWithRetry } from "./transport";
+import { callWithRetry } from "../transport";
 
 export interface CancelOutcome {
   booking: BookingRow;

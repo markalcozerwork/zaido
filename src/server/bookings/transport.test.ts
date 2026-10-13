@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { isTransientError } from "../../domain";
 import type { DbClient } from "../db-client";
 import { createBooking, toCreateArgs } from "./create";
-import { callWithRetry, type PostgrestResponseLike } from "./transport";
+import { callWithRetry, type PostgrestResponseLike } from "../transport";
 
 type Res = PostgrestResponseLike<unknown>;
 const ok = (data: unknown): Res => ({ data, error: null, status: 200 });

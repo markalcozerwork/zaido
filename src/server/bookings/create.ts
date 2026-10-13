@@ -25,8 +25,8 @@ import {
 import type { Row, RpcArgs } from "../../db";
 import { compact } from "../../domain/object";
 import type { DbClient } from "../db-client";
-import type { ServerDeps } from "./deps";
-import { callWithRetry } from "./transport";
+import type { ServerDeps } from "../deps";
+import { callWithRetry } from "../transport";
 
 export type BookingRow = Row<"bookings">;
 

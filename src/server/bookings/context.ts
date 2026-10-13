@@ -13,7 +13,7 @@ import type {
   VenueContextRow,
 } from "../../domain";
 import type { DbClient } from "../db-client";
-import { callWithRetry, type RetryOptions } from "./transport";
+import { callWithRetry, type RetryOptions } from "../transport";
 
 const COURT_COLUMNS =
   "id, venue_id, name, sport, is_active, hourly_rate, lights_fee_per_hour, lights_from, lights_until, " +

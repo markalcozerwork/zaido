@@ -24,8 +24,8 @@ import {
 } from "../../domain";
 import type { DbClient } from "../db-client";
 import { loadCourtBookingContext, loadVenueBookingContexts } from "./context";
-import { callWithRetry } from "./transport";
-import type { ServerDeps } from "./deps";
+import { callWithRetry } from "../transport";
+import type { ServerDeps } from "../deps";
 
 export interface DayAvailability {
   courtId: string;

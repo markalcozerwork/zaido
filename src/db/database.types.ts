@@ -255,6 +255,8 @@ export type Database = {
           id: string;
           is_archived: boolean;
           last_message_at: string | null;
+          last_rev: number;
+          last_seq: number;
           title: string | null;
           type: Database["public"]["Enums"]["channel_type"];
           updated_at: string;
@@ -269,6 +271,8 @@ export type Database = {
           id?: string;
           is_archived?: boolean;
           last_message_at?: string | null;
+          last_rev?: number;
+          last_seq?: number;
           title?: string | null;
           type: Database["public"]["Enums"]["channel_type"];
           updated_at?: string;
@@ -282,6 +286,8 @@ export type Database = {
           id?: string;
           is_archived?: boolean;
           last_message_at?: string | null;
+          last_rev?: number;
+          last_seq?: number;
           title?: string | null;
           type?: Database["public"]["Enums"]["channel_type"];
           updated_at?: string;
@@ -320,40 +326,58 @@ export type Database = {
       chat_messages: {
         Row: {
           channel_id: string;
+          client_id: string;
           created_at: string;
           deleted_at: string | null;
           deleted_by: string | null;
           edited_at: string | null;
           id: string;
+          media_height: number | null;
+          media_kind: string | null;
           media_url: string | null;
+          media_width: number | null;
           message_text: string | null;
           reply_to_id: string | null;
+          rev: number;
           sender_id: string | null;
+          seq: number;
         };
         ComputedFields: never;
         Insert: {
           channel_id: string;
+          client_id?: string;
           created_at?: string;
           deleted_at?: string | null;
           deleted_by?: string | null;
           edited_at?: string | null;
           id?: string;
+          media_height?: number | null;
+          media_kind?: string | null;
           media_url?: string | null;
+          media_width?: number | null;
           message_text?: string | null;
           reply_to_id?: string | null;
+          rev: number;
           sender_id?: string | null;
+          seq: number;
         };
         Update: {
           channel_id?: string;
+          client_id?: string;
           created_at?: string;
           deleted_at?: string | null;
           deleted_by?: string | null;
           edited_at?: string | null;
           id?: string;
+          media_height?: number | null;
+          media_kind?: string | null;
           media_url?: string | null;
+          media_width?: number | null;
           message_text?: string | null;
           reply_to_id?: string | null;
+          rev?: number;
           sender_id?: string | null;
+          seq?: number;
         };
         Relationships: [
           {
@@ -392,6 +416,7 @@ export type Database = {
           is_muted: boolean;
           joined_at: string;
           last_read_at: string;
+          last_read_seq: number;
           profile_id: string;
         };
         ComputedFields: never;
@@ -400,6 +425,7 @@ export type Database = {
           is_muted?: boolean;
           joined_at?: string;
           last_read_at?: string;
+          last_read_seq?: number;
           profile_id: string;
         };
         Update: {
@@ -407,6 +433,7 @@ export type Database = {
           is_muted?: boolean;
           joined_at?: string;
           last_read_at?: string;
+          last_read_seq?: number;
           profile_id?: string;
         };
         Relationships: [
@@ -420,6 +447,97 @@ export type Database = {
           {
             foreignKeyName: "chat_participants_profile_id_fkey";
             columns: ["profile_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
+      chat_reports: {
+        Row: {
+          channel_id: string | null;
+          created_at: string;
+          id: string;
+          message_id: string | null;
+          note: string | null;
+          reason: Database["public"]["Enums"]["chat_report_reason"];
+          reported_profile_id: string | null;
+          reporter_id: string | null;
+          resolution_note: string | null;
+          resolved_at: string | null;
+          resolved_by: string | null;
+          snapshot_media_path: string | null;
+          snapshot_text: string | null;
+          status: Database["public"]["Enums"]["chat_report_status"];
+          updated_at: string;
+        };
+        ComputedFields: never;
+        Insert: {
+          channel_id?: string | null;
+          created_at?: string;
+          id?: string;
+          message_id?: string | null;
+          note?: string | null;
+          reason: Database["public"]["Enums"]["chat_report_reason"];
+          reported_profile_id?: string | null;
+          reporter_id?: string | null;
+          resolution_note?: string | null;
+          resolved_at?: string | null;
+          resolved_by?: string | null;
+          snapshot_media_path?: string | null;
+          snapshot_text?: string | null;
+          status?: Database["public"]["Enums"]["chat_report_status"];
+          updated_at?: string;
+        };
+        Update: {
+          channel_id?: string | null;
+          created_at?: string;
+          id?: string;
+          message_id?: string | null;
+          note?: string | null;
+          reason?: Database["public"]["Enums"]["chat_report_reason"];
+          reported_profile_id?: string | null;
+          reporter_id?: string | null;
+          resolution_note?: string | null;
+          resolved_at?: string | null;
+          resolved_by?: string | null;
+          snapshot_media_path?: string | null;
+          snapshot_text?: string | null;
+          status?: Database["public"]["Enums"]["chat_report_status"];
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "chat_reports_channel_id_fkey";
+            columns: ["channel_id"];
+            isOneToOne: false;
+            referencedRelation: "chat_channels";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "chat_reports_message_id_fkey";
+            columns: ["message_id"];
+            isOneToOne: false;
+            referencedRelation: "chat_messages";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "chat_reports_reported_profile_id_fkey";
+            columns: ["reported_profile_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "chat_reports_reporter_id_fkey";
+            columns: ["reporter_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "chat_reports_resolved_by_fkey";
+            columns: ["resolved_by"];
             isOneToOne: false;
             referencedRelation: "profiles";
             referencedColumns: ["id"];
@@ -1326,6 +1444,40 @@ export type Database = {
           },
         ];
       };
+      profile_blocks: {
+        Row: {
+          blocked_id: string;
+          blocker_id: string;
+          created_at: string;
+        };
+        ComputedFields: never;
+        Insert: {
+          blocked_id: string;
+          blocker_id?: string;
+          created_at?: string;
+        };
+        Update: {
+          blocked_id?: string;
+          blocker_id?: string;
+          created_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "profile_blocks_blocked_id_fkey";
+            columns: ["blocked_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "profile_blocks_blocker_id_fkey";
+            columns: ["blocker_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
       profile_contacts: {
         Row: {
           birth_date: string | null;
@@ -1648,6 +1800,8 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      claim_chat_media_purge: { Args: { p_limit?: number }; Returns: string[] };
+      complete_chat_media_purge: { Args: { p_paths: string[] }; Returns: number };
       create_booking: {
         Args: {
           p_booked_by?: string;
@@ -1712,6 +1866,60 @@ export type Database = {
           isSetofReturn: false;
         };
       };
+      get_chat_inbox: {
+        Args: {
+          p_archived?: boolean;
+          p_before_activity?: string;
+          p_before_channel?: string;
+          p_channel_ids?: string[];
+          p_limit?: number;
+        };
+        Returns: {
+          activity_at: string;
+          blocked_by_me: boolean;
+          can_send: boolean;
+          channel_id: string;
+          channel_type: Database["public"]["Enums"]["channel_type"];
+          club_id: string;
+          event_id: string;
+          event_start_time: string;
+          event_status: Database["public"]["Enums"]["event_status"];
+          image_url: string;
+          is_archived: boolean;
+          is_muted: boolean;
+          last_message_created_at: string;
+          last_message_id: string;
+          last_message_is_deleted: boolean;
+          last_message_media_kind: string;
+          last_message_sender_id: string;
+          last_message_sender_name: string;
+          last_message_seq: number;
+          last_message_snippet: string;
+          last_read_seq: number;
+          last_seq: number;
+          partner_id: string;
+          partner_last_read_seq: number;
+          title: string;
+          unread_count: number;
+        }[];
+      };
+      get_chat_messages: {
+        Args: {
+          p_after_rev?: number;
+          p_after_seq?: number;
+          p_before_seq?: number;
+          p_channel_id: string;
+          p_limit?: number;
+        };
+        Returns: Json;
+      };
+      get_chat_unread_summary: {
+        Args: Record<PropertyKey, never>;
+        Returns: {
+          unread_channels: number;
+          unread_messages: number;
+        }[];
+      };
       get_coach_busy_slots: {
         Args: { p_coach_id: string; p_from: string; p_to: string };
         Returns: {
@@ -1745,6 +1953,24 @@ export type Database = {
           start_time: string;
         }[];
       };
+      list_chat_participants: {
+        Args: { p_after_profile?: string; p_channel_id: string; p_limit?: number };
+        Returns: {
+          avatar_url: string;
+          display_name: string;
+          joined_at: string;
+          profile_id: string;
+          role: string;
+        }[];
+      };
+      mark_chat_read: {
+        Args: { p_channel_id: string; p_up_to_seq: number };
+        Returns: {
+          channel_id: string;
+          last_read_seq: number;
+          unread_count: number;
+        }[];
+      };
       quote_court_booking: {
         Args: { p_coach_id?: string; p_court_id: string; p_end: string; p_start: string };
         Returns: {
@@ -1754,12 +1980,57 @@ export type Database = {
           total_amount: number;
         }[];
       };
+      report_chat_message: {
+        Args: {
+          p_message_id: string;
+          p_note?: string;
+          p_reason: Database["public"]["Enums"]["chat_report_reason"];
+        };
+        Returns: string;
+      };
+      send_chat_message: {
+        Args: {
+          p_channel_id: string;
+          p_client_id: string;
+          p_media_height?: number;
+          p_media_path?: string;
+          p_media_width?: number;
+          p_reply_to_id?: string;
+          p_text?: string;
+        };
+        Returns: {
+          channel_id: string;
+          client_id: string;
+          created_at: string;
+          deleted_at: string | null;
+          deleted_by: string | null;
+          edited_at: string | null;
+          id: string;
+          media_height: number | null;
+          media_kind: string | null;
+          media_url: string | null;
+          media_width: number | null;
+          message_text: string | null;
+          reply_to_id: string | null;
+          rev: number;
+          sender_id: string | null;
+          seq: number;
+        };
+        SetofOptions: {
+          from: "*";
+          to: "chat_messages";
+          isOneToOne: true;
+          isSetofReturn: false;
+        };
+      };
       timemultirange: { Args: Record<PropertyKey, never>; Returns: unknown };
     };
     Enums: {
       attendee_status: "REGISTERED" | "WAITLISTED" | "CHECKED_IN" | "CANCELLED";
       booking_status: "PENDING_PAYMENT" | "CONFIRMED" | "CANCELLED" | "COMPLETED";
       channel_type: "CLUB" | "EVENT" | "DIRECT";
+      chat_report_reason: "SPAM" | "HARASSMENT" | "HATE" | "SEXUAL_CONTENT" | "VIOLENCE" | "SCAM" | "OTHER";
+      chat_report_status: "OPEN" | "ACTIONED" | "DISMISSED";
       club_role: "ADMIN" | "COACH" | "MEMBER";
       court_surface:
         "TARAFLEX" | "WOOD" | "CONCRETE" | "ACRYLIC" | "ASPHALT" | "SYNTHETIC_GRASS" | "CLAY" | "RUBBER";
@@ -1908,6 +2179,8 @@ export const Constants = {
       attendee_status: ["REGISTERED", "WAITLISTED", "CHECKED_IN", "CANCELLED"],
       booking_status: ["PENDING_PAYMENT", "CONFIRMED", "CANCELLED", "COMPLETED"],
       channel_type: ["CLUB", "EVENT", "DIRECT"],
+      chat_report_reason: ["SPAM", "HARASSMENT", "HATE", "SEXUAL_CONTENT", "VIOLENCE", "SCAM", "OTHER"],
+      chat_report_status: ["OPEN", "ACTIONED", "DISMISSED"],
       club_role: ["ADMIN", "COACH", "MEMBER"],
       court_surface: [
         "TARAFLEX",

@@ -20,8 +20,8 @@ import {
 import type { UpdateRow } from "../../db";
 import type { DbClient } from "../db-client";
 import type { BookingRow } from "./create";
-import type { ServerDeps } from "./deps";
-import { callWithRetry } from "./transport";
+import type { ServerDeps } from "../deps";
+import { callWithRetry } from "../transport";
 
 /**
  * The player sends their GCash/Maya/bank reference (receipt optional, can

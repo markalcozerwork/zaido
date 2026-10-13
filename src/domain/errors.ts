@@ -56,6 +56,16 @@ export const GUARD_CODES = {
   COURT_BOOKING_REQUIRED: "booking_id",
   COURT_BOOKING_UNAVAILABLE: "booking_id",
   COACH_CONFIRMATION_REQUIRED: "coach_id",
+  // Step 4: chat
+  NOT_A_PARTICIPANT: undefined,
+  MESSAGING_UNAVAILABLE: undefined,
+  RATE_LIMITED: "text",
+  MESSAGE_EMPTY: "text",
+  INVALID_MEDIA: "media_path",
+  REPLY_NOT_IN_CHANNEL: "reply_to_id",
+  MESSAGE_DELETED: undefined,
+  EDIT_WINDOW_PASSED: "text",
+  CHANNEL_ARCHIVED: undefined,
 } as const satisfies Record<string, string | undefined>;
 
 export type GuardCode = keyof typeof GUARD_CODES;
@@ -70,8 +80,11 @@ export interface DomainError {
   retryable: boolean;
   /** Original SQLSTATE / PostgREST code, for logs. */
   cause?: string;
-  /** Extra machine data, e.g. the caller's existing booking for SLOT_ALREADY_YOURS. */
-  meta?: { bookingId?: string };
+  /**
+   * Extra machine data: the caller's existing booking for SLOT_ALREADY_YOURS,
+   * seconds to wait for RATE_LIMITED.
+   */
+  meta?: { bookingId?: string; retryAfterSeconds?: number };
 }
 
 /** The shape of PostgrestError (supabase-js) and node-postgres DatabaseError. */
@@ -217,6 +230,33 @@ const CONSTRAINTS: Record<string, Omit<DomainError, "retryable" | "cause">> = {
     message: "That barangay isn't in the selected city/municipality.",
     field: "barangay_code",
   },
+  // Step 4: chat
+  chat_messages_text_length: {
+    code: "VALIDATION_FAILED",
+    message: "Messages can be at most 4,000 characters.",
+    field: "text",
+  },
+  chat_messages_media_url_key: {
+    code: "INVALID_MEDIA",
+    message: "That photo is already attached to another message.",
+    field: "media_path",
+  },
+  chat_messages_sender_client_key: {
+    code: "CONFLICT",
+    message: "This message is still being sent. Please wait a moment.",
+  },
+  profile_blocks_pkey: { code: "CONFLICT", message: "You already blocked this player." },
+  profile_blocks_not_self: { code: "VALIDATION_FAILED", message: "You can't block yourself." },
+  chat_reports_note_length: {
+    code: "VALIDATION_FAILED",
+    message: "Keep the note under 500 characters.",
+    field: "note",
+  },
+  chat_reports_resolution_note_length: {
+    code: "VALIDATION_FAILED",
+    message: "Keep the note under 500 characters.",
+    field: "resolution_note",
+  },
 };
 
 /** Messages Postgres writes itself. Anything else with these codes came from our guards and is user-facing. */
@@ -253,6 +293,16 @@ export function mapDatabaseError(err: DatabaseErrorLike): DomainError {
         message: text,
         field: "start_time",
         ...(err.hint ? { meta: { bookingId: err.hint } } : {}),
+      };
+    }
+    if (tag === "RATE_LIMITED") {
+      const wait = Number(err.hint);
+      return {
+        ...base,
+        code: "RATE_LIMITED",
+        message: text,
+        field: "text",
+        ...(Number.isFinite(wait) && wait > 0 ? { meta: { retryAfterSeconds: wait } } : {}),
       };
     }
     if (tag in GUARD_CODES) {

@@ -81,3 +81,43 @@ select tests.eq(
       'court_closures_stamp', 'court_closures_broadcast']) as t
     where not exists (select 1 from pg_trigger g where g.tgname = t and not g.tgisinternal)),
   null, 'booking-engine triggers are installed');
+
+-- Step 4 ------------------------------------------------------------------------
+select tests.eq(
+  (select string_agg(t, ', ') from unnest(array[
+      'chat_messages_10_guard', 'chat_messages_20_sequence', 'chat_messages_80_after',
+      'chat_participants_10_defaults', 'chat_participants_20_guard', 'chat_participants_80_hints',
+      'chat_channels_80_hints', 'chat_channels_81_deleted', 'chat_reports_resolve']) as t
+    where not exists (select 1 from pg_trigger g where g.tgname = t and not g.tgisinternal)),
+  null, 'chat-engine triggers are installed');
+select tests.ok(not exists (select 1 from pg_trigger where tgname = 'chat_messages_touch_channel'),
+                'the old touch-channel trigger is gone (its work moved under the channel lock)');
+select tests.eq(
+  (select string_agg(p.oid::regprocedure::text, ', ')
+     from pg_proc p
+    where p.oid in ('app.tg_chat_messages_guard'::regproc, 'app.tg_chat_participants_guard'::regproc,
+                    'public.send_chat_message'::regproc, 'public.get_chat_messages'::regproc)
+      and p.prosecdef),
+  null, 'chat guards and the send/read RPCs stay SECURITY INVOKER (is_trusted_context() is true inside DEFINER code)');
+select tests.ok((select prosecdef from pg_proc where oid = 'app.tg_chat_messages_sequence'::regproc),
+                'the sequence trigger is SECURITY DEFINER (users cannot update chat_channels)');
+select tests.ok(not exists (select 1 from pg_publication_tables
+                             where pubname = 'supabase_realtime' and tablename in ('chat_messages', 'chat_participants')),
+                'chat tables are not in the Postgres Changes publication');
+select tests.ok(to_regclass('realtime.messages') is null
+                or (select count(*) from pg_policies where schemaname = 'realtime' and tablename = 'messages'
+                      and policyname in ('chat topics: members receive', 'chat typing: members send',
+                                         'user chat topic: owner receives')) = 3,
+                'the chat topic policies exist wherever Realtime does');
+select tests.eq(
+  (select string_agg(policyname, ', ') from pg_policies
+    where schemaname = 'realtime' and tablename = 'messages' and cmd in ('INSERT', 'ALL')
+      and policyname <> 'chat typing: members send'),
+  null, 'typing is the only client-sendable Realtime topic');
+select tests.eq(
+  (select string_agg(c.relname || ':' || r, ', ')
+     from pg_class c, unnest(array['anon', 'authenticated']) r
+    where c.relnamespace = 'public'::regnamespace and c.relkind = 'r'
+      and c.relname in ('profile_blocks', 'chat_reports')
+      and has_table_privilege(r, c.oid, 'truncate')),
+  null, 'new chat tables grant no TRUNCATE to API roles');

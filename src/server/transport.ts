@@ -12,7 +12,7 @@
  * errors, and transactions Postgres rolled back (40001, 40P01). Everything
  * else is a real answer and is mapped to a DomainError immediately.
  */
-import { isTransientError, mapDatabaseError, type DatabaseErrorLike, type DomainError } from "../../domain";
+import { isTransientError, mapDatabaseError, type DatabaseErrorLike, type DomainError } from "../domain";
 
 /** What a postgrest-js builder resolves to (the fields we use). */
 export interface PostgrestResponseLike<T> {

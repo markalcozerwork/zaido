@@ -19,6 +19,13 @@
 #   8. double-tap at hold cap - 1 → no false HOLD_LIMIT_REACHED
 #   9. N checkouts by one player at a 2-hold venue → exactly 2
 #  10. publish an event vs the venue moving its booking (RC + RR) → no write skew
+#   Step 4 (chat):
+#  11. N senders into one channel, half of them slow → gapless seq; a poller
+#      syncing by seq sees every message, one syncing by created_at may not
+#  12. one message double-tapped N times → 1 row, every call the same id
+#  13. 40 parallel sends by one person across 4 chats → exactly the rate limit
+#  14. two devices moving one read marker at once → the highest wins
+#  15. both people opening their DM at once → one thread
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -357,3 +364,140 @@ skew=$(qa -c "
 published=$(qa -c "select count(*) from public.events where id::text like '50000000-0000-4000-c000-0000000001%' and status = 'SCHEDULED'")
 [[ "$skew" -eq 0 ]] || { sed 's/^/    /' "$WORK"/move.1.*.out | head; fail "link vs reschedule: $skew live events on court time their booking no longer holds"; }
 echo "  ok - 12 publish-vs-reschedule races (6 READ COMMITTED, 6 REPEATABLE READ): $published published, 0 live events on court time they don't hold"
+
+# --- Step 4: chat -----------------------------------------------------------------
+CHAT_CLUB='40000000-0000-4000-c000-000000000001'
+q >/dev/null <<SQL
+insert into public.clubs (id, name, slug, sport, municipality_code, created_by)
+values ('$CHAT_CLUB', 'Race Chat Club', 'race-chat-club', 'PICKLEBALL', '9900100000', '$(racer 1)');
+insert into public.club_members (club_id, profile_id)
+select '$CHAT_CLUB', ('00000000-0000-4000-b000-' || lpad(g::text, 12, '0'))::uuid from generate_series(2, $N) g
+on conflict do nothing;
+SQL
+CHAT=$(qa -c "select id from public.chat_channels where type = 'CLUB' and club_id = '$CHAT_CLUB'")
+
+# 11. Sixteen senders; the odd ones start their transaction early and send late,
+# so their created_at (transaction start) is older than messages that commit
+# before them. A poller keeps two cursors while they race.
+GO="$(start_at)"
+( set +e
+  q >"$WORK/poll.out" 2>&1 <<SQL
+$(barrier "$GO");
+create temp table seen_seq (id uuid primary key);
+create temp table seen_at  (id uuid primary key);
+do \$\$
+declare
+  v_seq bigint := 0;
+  v_at  timestamptz := '-infinity';
+  r     record;
+  v_end timestamptz := clock_timestamp() + interval '3 seconds';
+begin
+  loop
+    for r in select m.id, m.seq from public.chat_messages m where m.channel_id = '$CHAT' and m.seq > v_seq order by m.seq loop
+      insert into seen_seq values (r.id) on conflict do nothing;
+      v_seq := r.seq;
+    end loop;
+    for r in select m.id, m.created_at from public.chat_messages m where m.channel_id = '$CHAT' and m.created_at > v_at order by m.created_at loop
+      insert into seen_at values (r.id) on conflict do nothing;
+      v_at := r.created_at;
+    end loop;
+    exit when clock_timestamp() > v_end;
+    perform pg_sleep(0.01);
+  end loop;
+end;
+\$\$;
+select 'SEEN ' || (select count(*) from seen_seq) || ' ' || (select count(*) from seen_at);
+SQL
+) &
+for i in $(seq 1 16); do
+  ( set +e
+    if (( i % 2 )); then
+      q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" \
+        -c "begin" -c "select now()" -c "select pg_sleep(0.3)" \
+        -c "select seq from public.send_chat_message('$CHAT', gen_random_uuid(), 'slow $i')" -c "commit" \
+        >"$WORK/send.$i.out" 2>&1
+    else
+      q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" -c "select pg_sleep(0.1)" \
+        -c "select seq from public.send_chat_message('$CHAT', gen_random_uuid(), 'fast $i')" \
+        >"$WORK/send.$i.out" 2>&1
+    fi; echo $? >"$WORK/send.$i.rc" ) &
+done
+wait
+okcalls=$(for i in $(seq 1 16); do cat "$WORK/send.$i.rc"; done | grep -cx 0 || true)
+shape=$(qa -c "select count(*) || ' ' || min(seq) || '-' || max(seq) || ' ' || count(distinct seq) || ' ' || bool_and(rev = seq)
+                 || ' ' || (select last_seq from public.chat_channels where id = '$CHAT')
+                 from public.chat_messages where channel_id = '$CHAT'")
+read -r _ by_seq by_at < <(grep -E '^ *SEEN ' "$WORK/poll.out" | sed 's/^ *//') || true
+[[ "$okcalls" -eq 16 && "$shape" == "16 1-16 16 true 16" && "${by_seq:-0}" -eq 16 ]] \
+  || { sed 's/^/    /' "$WORK/poll.out" "$WORK"/send.1.out | head -20; fail "chat ordering: ok=$okcalls shape='$shape' seen_by_seq=${by_seq:-?} seen_by_created_at=${by_at:-?}"; }
+echo "  ok - 16 racing senders (8 slow): seq 1-16 without gaps; a seq cursor saw all 16, a created_at cursor saw ${by_at}"
+
+# 12. One message double-tapped N times.
+KEY='cccccccc-0000-4000-a000-000000000012'
+GO="$(start_at)"
+for i in $(seq 1 "$N"); do
+  ( set +e
+    q -At -c "set role authenticated" -c "select tests.login('$(racer 17)'::uuid)" -c "$(barrier "$GO")" \
+      -c "select id from public.send_chat_message('$CHAT', '$KEY', 'Game at 6?')" >"$WORK/tap.$i.out" 2>&1
+    echo $? >"$WORK/tap.$i.rc" ) &
+done
+wait
+okcalls=$(for i in $(seq 1 "$N"); do cat "$WORK/tap.$i.rc"; done | grep -cx 0 || true)
+ids=$(for i in $(seq 1 "$N"); do grep -E '^[0-9a-f-]{36}$' "$WORK/tap.$i.out"; done | sort -u | wc -l)
+rows=$(qa -c "select count(*) || ' ' || (select last_seq from public.chat_channels where id = '$CHAT') from public.chat_messages where channel_id = '$CHAT'")
+[[ "$okcalls" -eq "$N" && "$ids" -eq 1 && "$rows" == "17 17" ]] \
+  || { for i in $(seq 1 "$N"); do sed 's/^/    /' "$WORK/tap.$i.out"; done | sort | uniq -c | head; fail "send double-tap: ok=$okcalls ids=$ids rows/last_seq=$rows"; }
+echo "  ok - $N double-taps of one message: 1 row, every call got its id, no gap in seq"
+
+# 13. 40 parallel sends by one person across 4 DMs: the limit holds under concurrency.
+SPAMMER="$(racer 24)"
+DMS=()
+for j in 20 21 22 23; do
+  DMS+=("$(q -At -c "set role authenticated" -c "select tests.login('$SPAMMER'::uuid)" \
+             -c "select public.get_or_create_direct_channel('$(racer "$j")')" | grep -E '^[0-9a-f-]{36}$')")
+done
+GO="$(start_at)"
+for i in $(seq 1 40); do
+  ( set +e
+    q -At -c "set role authenticated" -c "select tests.login('$SPAMMER'::uuid)" -c "$(barrier "$GO")" \
+      -c "select seq from public.send_chat_message('${DMS[$(( i % 4 ))]}', gen_random_uuid(), 'buy paddles $i')" >"$WORK/spam.$i.out" 2>&1
+    echo $? >"$WORK/spam.$i.rc" ) &
+done
+wait
+okcalls=$(for i in $(seq 1 40); do cat "$WORK/spam.$i.rc"; done | grep -cx 0 || true)
+limited=$(grep -l 'RATE_LIMITED' "$WORK"/spam.*.out 2>/dev/null | wc -l || true)
+limit=$(qa -c "select app.chat_rate_limit_count()")
+[[ "$okcalls" -eq "$limit" && "$limited" -eq $(( 40 - limit )) ]] \
+  || { for i in $(seq 1 40); do sed 's/^/    /' "$WORK/spam.$i.out"; done | sort | uniq -c | head; fail "rate limit race: ok=$okcalls limited=$limited (limit $limit)"; }
+echo "  ok - 40 parallel sends across 4 chats by one person: exactly $limit accepted, $limited RATE_LIMITED"
+
+# 14. Two devices of racer 2 move the club read marker to different positions at once.
+GO="$(start_at)"
+for i in $(seq 1 12); do
+  ( set +e
+    q -c "set role authenticated" -c "select tests.login('$(racer 2)'::uuid)" -c "$(barrier "$GO")" \
+      -c "select public.mark_chat_read('$CHAT', $(( (i * 7) % 17 )))" >"$WORK/mark.$i.out" 2>&1 ) &
+done
+wait
+marker=$(qa -c "select last_read_seq from public.chat_participants where channel_id = '$CHAT' and profile_id = '$(racer 2)'")
+want=$(for i in $(seq 1 12); do echo $(( (i * 7) % 17 )); done | sort -n | tail -1)
+own=$(qa -c "select coalesce(max(seq), 0) from public.chat_messages where channel_id = '$CHAT' and sender_id = '$(racer 2)'")
+(( want < own )) && want=$own
+[[ "$marker" -eq "$want" ]] || { sed 's/^/    /' "$WORK"/mark.1.out; fail "read marker race: marker=$marker, expected $want"; }
+echo "  ok - 12 simultaneous read-marker moves from two devices: the highest position ($marker) won"
+
+# 15. Both people open their DM at the same moment, many times over.
+GO="$(start_at)"
+for i in $(seq 1 "$N"); do
+  me=$(( i % 2 ? 18 : 19 )); other=$(( i % 2 ? 19 : 18 ))
+  ( set +e
+    q -At -c "set role authenticated" -c "select tests.login('$(racer "$me")'::uuid)" -c "$(barrier "$GO")" \
+      -c "select public.get_or_create_direct_channel('$(racer "$other")')" >"$WORK/dm.$i.out" 2>&1 ) &
+done
+wait
+ids=$(for i in $(seq 1 "$N"); do grep -E '^[0-9a-f-]{36}$' "$WORK/dm.$i.out"; done | sort -u | wc -l)
+threads=$(qa -c "select count(*) from public.chat_channels where type = 'DIRECT'
+                   and dm_profile_low = least('$(racer 18)'::uuid, '$(racer 19)'::uuid)
+                   and dm_profile_high = greatest('$(racer 18)'::uuid, '$(racer 19)'::uuid)")
+[[ "$ids" -eq 1 && "$threads" -eq 1 ]] || { sed 's/^/    /' "$WORK"/dm.1.out; fail "DM open race: ids=$ids threads=$threads"; }
+echo "  ok - $N simultaneous DM opens by both people: one thread, one id"

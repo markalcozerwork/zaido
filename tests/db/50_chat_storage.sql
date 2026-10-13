@@ -68,8 +68,13 @@ select tests.eq((select count(*) from public.chat_messages where channel_id = :'
 -- Leaving the club revokes chat access immediately.
 select tests.login('alice');
 delete from public.club_members where club_id = '40000000-0000-4000-a000-000000000001' and profile_id = tests.uid('alice');
-select tests.eq((select count(*) from public.chat_messages where channel_id = :'club_chat')::int, 0,
+select tests.eq((select count(*) from public.chat_messages
+                  where channel_id = :'club_chat' and sender_id is distinct from tests.uid('alice'))::int, 0,
                 'leaving a club removes access to its chat history');
+-- [Step 4] Except your own messages, so you can still delete them.
+select tests.eq((select count(*) from public.chat_messages
+                  where channel_id = :'club_chat' and sender_id = tests.uid('alice'))::int, 1,
+                'ex-members still see (only) their own messages');
 
 -- -----------------------------------------------------------------------------
 -- Storage: payment receipts (private, append-only), avatars
