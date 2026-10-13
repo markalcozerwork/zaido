@@ -75,6 +75,9 @@ async function setupVenue(db: Db, timezone = "Asia/Manila") {
       gcash_account_name: "Olivia",
       gcash_number: "+639170000001",
       timezone,
+      // Admin-verified: front-desk bookings on behalf of players need it (Step 3).
+      verification_status: "VERIFIED",
+      max_active_holds_per_player: 50,
     }),
   );
   await run(
@@ -271,6 +274,15 @@ describe("end-to-end booking flow with the schemas", () => {
     );
     expect(describeBooking(booking)).toMatchObject({ label: "Awaiting payment", nextAction: "PAY" });
 
+    // Step 3: the receipt must exist in the booking's own folder before it's submitted.
+    await run(
+      db,
+      insertSql(
+        "storage.objects",
+        { bucket_id: "payment-receipts", name: `${booking.id}/gcash.png` },
+        "name",
+      ),
+    );
     const submission = paymentSubmissionSchema.parse({
       booking_id: booking.id,
       payment_method: "GCASH",
@@ -329,6 +341,10 @@ describe("end-to-end booking flow with the schemas", () => {
     expect(await tryRun(db, updateSql("bookings", reject, { id }))).toMatchObject({ ok: true });
     await db.asAdmin();
     await db.asUser(player);
+    await run(
+      db,
+      insertSql("storage.objects", { bucket_id: "payment-receipts", name: `${id}/retry.jpg` }, "name"),
+    );
     const resubmit = toPaymentSubmissionUpdate(
       paymentSubmissionSchema.parse({
         booking_id: id,
@@ -447,9 +463,10 @@ describe("real database errors → DomainError", () => {
     const codes = [overlap, reused, forbidden, closed].map((r) => (r.ok ? "ACCEPTED" : mapDatabaseError(r)));
     expect(codes[0]).toMatchObject({ code: "SLOT_TAKEN", field: "start_time" });
     expect(codes[1]).toMatchObject({ code: "PAYMENT_REF_ALREADY_USED", field: "payment_ref_no" });
-    expect(codes[2]).toMatchObject({ code: "FORBIDDEN", message: "You don't have permission to do that." });
+    expect(codes[2]).toMatchObject({ code: "FORBIDDEN", message: "You can only book for yourself." });
     expect(codes[3]).toMatchObject({
-      code: "RULE_VIOLATION",
+      code: "VENUE_CLOSED",
+      field: "start_time",
       message: "The venue is closed during part of the selected time.",
     });
   });

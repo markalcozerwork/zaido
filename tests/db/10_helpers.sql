@@ -17,6 +17,7 @@ create or replace function tests.uid(p_name text) returns uuid language sql immu
     when 'carlos' then '00000000-0000-4000-a000-000000000004'  -- coach / club admin
     when 'mia'    then '00000000-0000-4000-a000-000000000005'  -- venue front desk
     when 'dave'   then '00000000-0000-4000-a000-000000000006'  -- outsider
+    when 'erin'   then '00000000-0000-4000-a000-000000000007'  -- fresh player (Step 3 suite)
   end::uuid;
 $$;
 

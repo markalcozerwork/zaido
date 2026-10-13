@@ -113,6 +113,8 @@ select tests.throws($$ update public.bookings set payment_verified_by = tests.ui
 select tests.throws($$ delete from public.bookings where id = '30000000-0000-4000-a000-000000000001' $$,
                     '42501', 'bookings can never be deleted by users');
 
+-- The receipt must be uploaded to the booking's own folder before it's submitted (Step 3 rule).
+insert into storage.objects (bucket_id, name) values ('payment-receipts', '30000000-0000-4000-a000-000000000001/receipt.jpg');
 update public.bookings
    set payment_ref_no = '1009876543210', payment_receipt_url = '30000000-0000-4000-a000-000000000001/receipt.jpg',
        payment_status = 'AWAITING_VERIFICATION'
@@ -187,7 +189,7 @@ select tests.throws($$ update public.bookings set booking_status = 'CANCELLED' w
 reset role;
 insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method, payment_due_at)
 values ('30000000-0000-4000-a000-000000000005', :c2, tests.uid('dave'), tests.slot(4, '10:00'), tests.slot(4, '11:00'),
-        'GCASH', now() - interval '1 minute');
+        'GCASH', now() - interval '10 minutes');   -- past due + grace
 set role authenticated;
 select tests.login('alice');
 insert into public.bookings (court_id, booked_by, start_time, end_time, payment_method)

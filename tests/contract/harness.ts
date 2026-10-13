@@ -131,11 +131,13 @@ export function createdRow<T>(outcome: Outcome): T {
 }
 
 /** INSERT built from an object's keys, so omitted columns take their DB default. */
+/** `table` is a public table name, or schema-qualified ("storage.objects"). */
 export function insertSql(table: string, row: Record<string, unknown>, returning = "*"): Statement {
   const cols = Object.keys(row);
   const params = cols.map((_, i) => `$${i + 1}`);
+  const target = table.includes(".") ? table : `public.${table}`;
   return {
-    sql: `insert into public.${table} (${cols.map((c) => `"${c}"`).join(", ")}) values (${params.join(", ")}) returning ${returning}`,
+    sql: `insert into ${target} (${cols.map((c) => `"${c}"`).join(", ")}) values (${params.join(", ")}) returning ${returning}`,
     params: Object.values(row),
   };
 }

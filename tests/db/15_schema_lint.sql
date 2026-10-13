@@ -50,3 +50,23 @@ select tests.ok(has_table_privilege('authenticated', 'public.bookings', 'insert'
                 and not has_table_privilege('authenticated', 'public.bookings', 'delete')
                 and not has_table_privilege('authenticated', 'public.bookings', 'truncate'),
                 'bookings: insert yes, delete/truncate never');
+
+-- Step 3 ------------------------------------------------------------------------
+select tests.eq(
+  (select string_agg(p.proname, ', ' order by p.proname)
+     from pg_proc p
+    where p.pronamespace = 'public'::regnamespace
+      and has_function_privilege('anon', p.oid, 'execute')
+      and p.prorettype not in ('public.timerange'::regtype, 'public.timemultirange'::regtype)
+      and p.proname not in ('get_court_busy_slots', 'get_venue_busy_slots', 'get_coach_busy_slots', 'quote_court_booking')),
+  null, 'anon can execute only the allow-listed public RPCs');
+
+select tests.ok(not (select prosecdef from pg_proc where oid = 'public.create_booking'::regproc),
+                'create_booking stays SECURITY INVOKER (a DEFINER version would bypass every guard rule)');
+
+select tests.eq(
+  (select string_agg(t, ', ') from unnest(array[
+      'bookings_guard', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
+      'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments']) as t
+    where not exists (select 1 from pg_trigger g where g.tgname = t and not g.tgisinternal)),
+  null, 'booking-engine triggers are installed');

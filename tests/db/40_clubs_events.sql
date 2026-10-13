@@ -74,17 +74,30 @@ select tests.throws($$ insert into public.events (club_id, organizer_id, title, 
                     '42501', 'plain members cannot create club events');
 
 select tests.login('carlos');
-insert into public.events (id, club_id, venue_id, court_id, organizer_id, title, sport, event_type, rotation_format,
+-- Publishing an event on a court requires the organiser's own confirmed court booking (Step 3).
+select tests.throws($$ insert into public.events (club_id, venue_id, court_id, organizer_id, title, sport, event_type,
+                                                  start_time, end_time, max_participants)
+                       values ('40000000-0000-4000-a000-000000000001', '10000000-0000-4000-a000-000000000001',
+                               '20000000-0000-4000-a000-000000000002', tests.uid('carlos'), 'No court booked', 'PICKLEBALL',
+                               'OPEN_PLAY', tests.slot(2, '18:00'), tests.slot(2, '21:00'), 2) $$,
+                    '23514', 'an event cannot be published on a court nobody booked');
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method)
+values ('30000000-0000-4000-a000-000000000040', '20000000-0000-4000-a000-000000000002', tests.uid('carlos'),
+        tests.slot(2, '18:00'), tests.slot(2, '21:00'), 'CASH_ON_COURT');
+insert into public.events (id, club_id, venue_id, court_id, booking_id, organizer_id, title, sport, event_type, rotation_format,
                            start_time, end_time, max_participants, fee_per_pax)
 values ('50000000-0000-4000-a000-000000000001', '40000000-0000-4000-a000-000000000001',
         '10000000-0000-4000-a000-000000000001', '20000000-0000-4000-a000-000000000002',
+        '30000000-0000-4000-a000-000000000040',
         tests.uid('carlos'), 'Wednesday Night Open Play', 'PICKLEBALL', 'OPEN_PLAY', 'FOUR_IN_FOUR_OUT',
         tests.slot(2, '18:00'), tests.slot(2, '21:00'), 2, 150);
+select tests.eq((select reserved_for_event_id from public.bookings where id = '30000000-0000-4000-a000-000000000040'),
+                '50000000-0000-4000-a000-000000000001'::uuid, 'publishing the event reserves its court booking');
 select tests.eq((select municipality_code from public.events where id = '50000000-0000-4000-a000-000000000001'), '9900100000',
                 'event location inherited from venue');
-select tests.throws($$ insert into public.events (organizer_id, venue_id, court_id, title, sport, event_type, start_time, end_time, max_participants)
+select tests.throws($$ insert into public.events (organizer_id, venue_id, court_id, title, sport, event_type, status, start_time, end_time, max_participants)
                        values (tests.uid('carlos'), '10000000-0000-4000-a000-000000000001', '20000000-0000-4000-a000-000000000099',
-                               'Ghost court', 'PICKLEBALL', 'OPEN_PLAY', tests.slot(2, '18:00'), tests.slot(2, '21:00'), 4) $$,
+                               'Ghost court', 'PICKLEBALL', 'OPEN_PLAY', 'DRAFT', tests.slot(2, '18:00'), tests.slot(2, '21:00'), 4) $$,
                     '23503', 'court must belong to the event venue');
 select tests.throws($$ insert into public.events (organizer_id, municipality_code, title, sport, event_type, start_time, end_time, max_participants)
                        values (tests.uid('carlos'), '9900100000', 'Clinic w/o coach', 'PICKLEBALL', 'CLINIC',

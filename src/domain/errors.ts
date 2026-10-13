@@ -10,6 +10,7 @@
 export type DomainErrorCode =
   | "VALIDATION_FAILED"
   | "SLOT_TAKEN"
+  | "SLOT_ALREADY_YOURS"
   | "COACH_UNAVAILABLE"
   | "PAYMENT_REF_ALREADY_USED"
   | "EVENT_FULL"
@@ -20,7 +21,42 @@ export type DomainErrorCode =
   | "UNAUTHENTICATED"
   | "NOT_FOUND"
   | "RETRYABLE"
-  | "UNKNOWN";
+  | "UNKNOWN"
+  // Business rules raised by the database as "CODE: message" (see GUARD_CODES).
+  | GuardCode;
+
+/**
+ * Codes the SQL guards put in front of their messages ("VENUE_CLOSED: The
+ * venue is closed…"). PostgREST forwards only code/message/details/hint, so
+ * the prefix is the stable contract between SQL and TypeScript. Each maps to
+ * the form field the UI should highlight.
+ */
+export const GUARD_CODES = {
+  SLOT_IN_PAST: "start_time",
+  TOO_SOON: "start_time",
+  BEYOND_HORIZON: "start_time",
+  OFF_INCREMENT: "start_time",
+  DURATION_OUT_OF_RANGE: "end_time",
+  VENUE_CLOSED: "start_time",
+  VENUE_HOURS_NOT_SET: "start_time",
+  COURT_CLOSED: "start_time",
+  COURT_INACTIVE: "court_id",
+  PAYMENT_METHOD_UNAVAILABLE: "payment_method",
+  PAY_FIRST: "payment_ref_no",
+  HOLD_LIMIT_REACHED: undefined,
+  HOLD_EXPIRED: "payment_ref_no",
+  PAYMENT_LOCKED: "payment_ref_no",
+  RECEIPT_INVALID: "receipt_path",
+  CANCELLATION_CUTOFF: undefined,
+  CANCELLATION_CLOSED: undefined,
+  IDEMPOTENCY_KEY_REUSED: undefined,
+  COURT_RESERVED_FOR_EVENT: undefined,
+  COURT_BOOKING_REQUIRED: "booking_id",
+  COURT_BOOKING_UNAVAILABLE: "booking_id",
+  COACH_CONFIRMATION_REQUIRED: "coach_id",
+} as const satisfies Record<string, string | undefined>;
+
+export type GuardCode = keyof typeof GUARD_CODES;
 
 export interface DomainError {
   code: DomainErrorCode;
@@ -32,6 +68,8 @@ export interface DomainError {
   retryable: boolean;
   /** Original SQLSTATE / PostgREST code, for logs. */
   cause?: string;
+  /** Extra machine data, e.g. the caller's existing booking for SLOT_ALREADY_YOURS. */
+  meta?: { bookingId?: string };
 }
 
 /** The shape of PostgrestError (supabase-js) and node-postgres DatabaseError. */
@@ -121,10 +159,34 @@ function constraintName(err: DatabaseErrorLike): string | undefined {
 const humanMessage = (err: DatabaseErrorLike, fallback: string): string =>
   err.message && !SYSTEM_MESSAGE.test(err.message) ? err.message : fallback;
 
+const PREFIXED = /^([A-Z][A-Z_]+):\s+(.*)$/s;
+
 export function mapDatabaseError(err: DatabaseErrorLike): DomainError {
   const code = err.code ?? "";
   const known = constraintName(err);
   const base = { retryable: false, cause: code || undefined };
+
+  // "CODE: human message" raised by a guard: stable code, prefix stripped.
+  const prefixed = err.message ? PREFIXED.exec(err.message) : null;
+  if (prefixed) {
+    const [, tag, text] = prefixed as unknown as [string, string, string];
+    if (tag === "COACH_UNAVAILABLE")
+      return { ...base, code: "COACH_UNAVAILABLE", message: text, field: "coach_id" };
+    if (tag === "EVENT_FULL") return { ...base, code: "EVENT_FULL", message: text };
+    if (tag === "SLOT_ALREADY_YOURS") {
+      return {
+        ...base,
+        code: "SLOT_ALREADY_YOURS",
+        message: text,
+        field: "start_time",
+        ...(err.hint ? { meta: { bookingId: err.hint } } : {}),
+      };
+    }
+    if (tag in GUARD_CODES) {
+      const field = GUARD_CODES[tag as GuardCode];
+      return { ...base, code: tag as GuardCode, message: text, ...(field ? { field } : {}) };
+    }
+  }
 
   if (known && CONSTRAINTS[known]) return { ...base, ...CONSTRAINTS[known] };
 
@@ -141,9 +203,6 @@ export function mapDatabaseError(err: DatabaseErrorLike): DomainError {
       };
     case "23514":
     case "23502":
-      if (err.message?.startsWith("EVENT_FULL")) {
-        return { ...base, code: "EVENT_FULL", message: err.message.replace(/^EVENT_FULL:\s*/, "") };
-      }
       return { ...base, code: "RULE_VIOLATION", message: humanMessage(err, "That change isn't allowed.") };
     case "22023":
     case "22P02":

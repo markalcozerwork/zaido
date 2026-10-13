@@ -78,9 +78,11 @@ export type Database = {
           court_amount: number;
           court_id: string;
           created_at: string;
+          created_by: string | null;
           discount_amount: number;
           end_time: string;
           id: string;
+          idempotency_key: string | null;
           lights_amount: number;
           notes: string | null;
           payment_due_at: string | null;
@@ -94,11 +96,14 @@ export type Database = {
           payment_verified_by: string | null;
           player_count: number | null;
           reference_code: string;
+          reserved_for_event_id: string | null;
           start_time: string;
           time_range: unknown;
           total_amount: number;
           updated_at: string;
           venue_id: string;
+          walk_in_name: string | null;
+          walk_in_phone: string | null;
         };
         ComputedFields: never;
         Insert: {
@@ -114,9 +119,11 @@ export type Database = {
           court_amount: number;
           court_id: string;
           created_at?: string;
+          created_by?: string | null;
           discount_amount?: number;
           end_time: string;
           id?: string;
+          idempotency_key?: string | null;
           lights_amount?: number;
           notes?: string | null;
           payment_due_at?: string | null;
@@ -130,11 +137,14 @@ export type Database = {
           payment_verified_by?: string | null;
           player_count?: number | null;
           reference_code?: string;
+          reserved_for_event_id?: string | null;
           start_time: string;
           time_range?: never;
           total_amount: number;
           updated_at?: string;
           venue_id: string;
+          walk_in_name?: string | null;
+          walk_in_phone?: string | null;
         };
         Update: {
           booked_by?: string;
@@ -149,9 +159,11 @@ export type Database = {
           court_amount?: number;
           court_id?: string;
           created_at?: string;
+          created_by?: string | null;
           discount_amount?: number;
           end_time?: string;
           id?: string;
+          idempotency_key?: string | null;
           lights_amount?: number;
           notes?: string | null;
           payment_due_at?: string | null;
@@ -165,11 +177,14 @@ export type Database = {
           payment_verified_by?: string | null;
           player_count?: number | null;
           reference_code?: string;
+          reserved_for_event_id?: string | null;
           start_time?: string;
           time_range?: never;
           total_amount?: number;
           updated_at?: string;
           venue_id?: string;
+          walk_in_name?: string | null;
+          walk_in_phone?: string | null;
         };
         Relationships: [
           {
@@ -208,10 +223,24 @@ export type Database = {
             referencedColumns: ["venue_id", "id"];
           },
           {
+            foreignKeyName: "bookings_created_by_fkey";
+            columns: ["created_by"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
             foreignKeyName: "bookings_payment_verified_by_fkey";
             columns: ["payment_verified_by"];
             isOneToOne: false;
             referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "bookings_reserved_for_event_id_fkey";
+            columns: ["reserved_for_event_id"];
+            isOneToOne: false;
+            referencedRelation: "events";
             referencedColumns: ["id"];
           },
         ];
@@ -646,6 +675,62 @@ export type Database = {
           },
         ];
       };
+      court_closures: {
+        Row: {
+          court_id: string | null;
+          created_at: string;
+          created_by: string | null;
+          ends_at: string;
+          id: string;
+          reason: string;
+          starts_at: string;
+          venue_id: string;
+        };
+        ComputedFields: never;
+        Insert: {
+          court_id?: string | null;
+          created_at?: string;
+          created_by?: string | null;
+          ends_at: string;
+          id?: string;
+          reason: string;
+          starts_at: string;
+          venue_id: string;
+        };
+        Update: {
+          court_id?: string | null;
+          created_at?: string;
+          created_by?: string | null;
+          ends_at?: string;
+          id?: string;
+          reason?: string;
+          starts_at?: string;
+          venue_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "court_closures_court_fk";
+            columns: ["venue_id", "court_id"];
+            isOneToOne: false;
+            referencedRelation: "courts";
+            referencedColumns: ["venue_id", "id"];
+          },
+          {
+            foreignKeyName: "court_closures_created_by_fkey";
+            columns: ["created_by"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "court_closures_venue_id_fkey";
+            columns: ["venue_id"];
+            isOneToOne: false;
+            referencedRelation: "venues";
+            referencedColumns: ["id"];
+          },
+        ];
+      };
       court_rate_rules: {
         Row: {
           court_id: string;
@@ -891,6 +976,7 @@ export type Database = {
           cancellation_reason: string | null;
           cancelled_at: string | null;
           club_id: string | null;
+          coach_confirmed_at: string | null;
           coach_id: string | null;
           court_id: string | null;
           created_at: string;
@@ -927,6 +1013,7 @@ export type Database = {
           cancellation_reason?: string | null;
           cancelled_at?: string | null;
           club_id?: string | null;
+          coach_confirmed_at?: string | null;
           coach_id?: string | null;
           court_id?: string | null;
           created_at?: string;
@@ -962,6 +1049,7 @@ export type Database = {
           cancellation_reason?: string | null;
           cancelled_at?: string | null;
           club_id?: string | null;
+          coach_confirmed_at?: string | null;
           coach_id?: string | null;
           court_id?: string | null;
           created_at?: string;
@@ -1438,6 +1526,7 @@ export type Database = {
           auto_confirm_cash_bookings: boolean;
           bank_transfer_details: string | null;
           barangay_code: string;
+          booking_horizon_days: number;
           cancellation_cutoff_hours: number;
           contact_email: string | null;
           contact_number: string | null;
@@ -1447,10 +1536,13 @@ export type Database = {
           gcash_number: string | null;
           id: string;
           is_active: boolean;
+          is_open_24h: boolean;
           latitude: number | null;
           longitude: number | null;
+          max_active_holds_per_player: number;
           maya_account_name: string | null;
           maya_number: string | null;
+          min_lead_minutes: number;
           municipality_code: string;
           name: string;
           owner_id: string;
@@ -1468,6 +1560,7 @@ export type Database = {
           auto_confirm_cash_bookings?: boolean;
           bank_transfer_details?: string | null;
           barangay_code: string;
+          booking_horizon_days?: number;
           cancellation_cutoff_hours?: number;
           contact_email?: string | null;
           contact_number?: string | null;
@@ -1477,10 +1570,13 @@ export type Database = {
           gcash_number?: string | null;
           id?: string;
           is_active?: boolean;
+          is_open_24h?: boolean;
           latitude?: number | null;
           longitude?: number | null;
+          max_active_holds_per_player?: number;
           maya_account_name?: string | null;
           maya_number?: string | null;
+          min_lead_minutes?: number;
           municipality_code: string;
           name: string;
           owner_id: string;
@@ -1497,6 +1593,7 @@ export type Database = {
           auto_confirm_cash_bookings?: boolean;
           bank_transfer_details?: string | null;
           barangay_code?: string;
+          booking_horizon_days?: number;
           cancellation_cutoff_hours?: number;
           contact_email?: string | null;
           contact_number?: string | null;
@@ -1506,10 +1603,13 @@ export type Database = {
           gcash_number?: string | null;
           id?: string;
           is_active?: boolean;
+          is_open_24h?: boolean;
           latitude?: number | null;
           longitude?: number | null;
+          max_active_holds_per_player?: number;
           maya_account_name?: string | null;
           maya_number?: string | null;
+          min_lead_minutes?: number;
           municipality_code?: string;
           name?: string;
           owner_id?: string;
@@ -1548,15 +1648,103 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      create_booking: {
+        Args: {
+          p_booked_by?: string;
+          p_coach_id?: string;
+          p_court_id: string;
+          p_discount_amount?: number;
+          p_end: string;
+          p_idempotency_key?: string;
+          p_mark_paid?: boolean;
+          p_notes?: string;
+          p_payment_method: Database["public"]["Enums"]["payment_method"];
+          p_payment_ref_no?: string;
+          p_player_count?: number;
+          p_start: string;
+          p_walk_in_name?: string;
+          p_walk_in_phone?: string;
+        };
+        Returns: {
+          booked_by: string;
+          booking_status: Database["public"]["Enums"]["booking_status"];
+          cancellation_reason: string | null;
+          cancelled_at: string | null;
+          cancelled_by: string | null;
+          coach_amount: number;
+          coach_id: string | null;
+          completed_at: string | null;
+          confirmed_at: string | null;
+          court_amount: number;
+          court_id: string;
+          created_at: string;
+          created_by: string | null;
+          discount_amount: number;
+          end_time: string;
+          id: string;
+          idempotency_key: string | null;
+          lights_amount: number;
+          notes: string | null;
+          payment_due_at: string | null;
+          payment_method: Database["public"]["Enums"]["payment_method"];
+          payment_receipt_url: string | null;
+          payment_ref_no: string | null;
+          payment_rejection_reason: string | null;
+          payment_status: Database["public"]["Enums"]["payment_status"];
+          payment_submitted_at: string | null;
+          payment_verified_at: string | null;
+          payment_verified_by: string | null;
+          player_count: number | null;
+          reference_code: string;
+          reserved_for_event_id: string | null;
+          start_time: string;
+          time_range: unknown;
+          total_amount: number;
+          updated_at: string;
+          venue_id: string;
+          walk_in_name: string | null;
+          walk_in_phone: string | null;
+        };
+        SetofOptions: {
+          from: "*";
+          to: "bookings";
+          isOneToOne: true;
+          isSetofReturn: false;
+        };
+      };
+      get_coach_busy_slots: {
+        Args: { p_coach_id: string; p_from: string; p_to: string };
+        Returns: {
+          end_time: string;
+          start_time: string;
+        }[];
+      };
       get_court_busy_slots: {
         Args: { p_court_id: string; p_from: string; p_to: string };
         Returns: {
+          booking_id: string;
           end_time: string;
+          held_until: string;
           is_mine: boolean;
+          kind: string;
+          reason: string;
           start_time: string;
         }[];
       };
       get_or_create_direct_channel: { Args: { p_other_profile_id: string }; Returns: string };
+      get_venue_busy_slots: {
+        Args: { p_from: string; p_to: string; p_venue_id: string };
+        Returns: {
+          booking_id: string;
+          court_id: string;
+          end_time: string;
+          held_until: string;
+          is_mine: boolean;
+          kind: string;
+          reason: string;
+          start_time: string;
+        }[];
+      };
       quote_court_booking: {
         Args: { p_coach_id?: string; p_court_id: string; p_end: string; p_start: string };
         Returns: {

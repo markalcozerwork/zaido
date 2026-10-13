@@ -89,7 +89,8 @@ select tests.eq(tests.affected($$ update storage.objects set name = name || '.ba
                 'receipts cannot be overwritten (evidence)');
 
 select tests.login('mia');
-select tests.eq((select count(*) from storage.objects where bucket_id = 'payment-receipts')::int, 1,
+select tests.eq((select count(*) from storage.objects
+                  where bucket_id = 'payment-receipts' and name like '30000000-0000-4000-a000-000000000002/%')::int, 1,
                 'venue front desk can open receipts for their venue');
 select tests.login('dave');
 select tests.eq((select count(*) from storage.objects where bucket_id = 'payment-receipts')::int, 0,

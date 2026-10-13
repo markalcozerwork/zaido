@@ -91,6 +91,13 @@ values ('10000000-0000-4000-a000-000000000001', tests.uid('olivia'), 'Kapitolyo 
 
 select tests.eq((select verification_status::text from public.venues where id = '10000000-0000-4000-a000-000000000001'),
                 'UNVERIFIED', 'venues cannot self-verify');
+-- A RacketHub admin verifies the venue (needed for front-desk bookings on behalf of
+-- players), and the fixture allows more simultaneous holds than the default 3.
+reset role;
+update public.venues set verification_status = 'VERIFIED', max_active_holds_per_player = 10
+ where id = '10000000-0000-4000-a000-000000000001';
+set role authenticated;
+select tests.login('olivia');
 select tests.ok((select is_venue_owner from public.profiles where id = tests.uid('olivia')), 'is_venue_owner flag set');
 
 select tests.throws($$ insert into public.venues (owner_id, name, municipality_code, barangay_code, address)

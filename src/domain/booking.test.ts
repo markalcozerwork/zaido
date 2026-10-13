@@ -346,6 +346,46 @@ describe("mapDatabaseError", () => {
     });
   });
 
+  it("turns guard prefixes into typed codes with fields, and strips the prefix", () => {
+    expect(
+      mapDatabaseError({
+        code: "23514",
+        message: "VENUE_CLOSED: The venue is closed during part of the selected time.",
+      }),
+    ).toEqual({
+      code: "VENUE_CLOSED",
+      message: "The venue is closed during part of the selected time.",
+      field: "start_time",
+      retryable: false,
+      cause: "23514",
+    });
+    expect(mapDatabaseError({ code: "23514", message: "PAY_FIRST: Send the payment first." })).toMatchObject({
+      code: "PAY_FIRST",
+      field: "payment_ref_no",
+    });
+    expect(
+      mapDatabaseError({
+        code: "23P01",
+        message: "COACH_UNAVAILABLE: This coach is already booked at that time.",
+      }),
+    ).toMatchObject({ code: "COACH_UNAVAILABLE", field: "coach_id" });
+    expect(
+      mapDatabaseError({
+        code: "23P01",
+        message: "SLOT_ALREADY_YOURS: You already have this court.",
+        hint: "abc-123",
+      }),
+    ).toMatchObject({ code: "SLOT_ALREADY_YOURS", meta: { bookingId: "abc-123" } });
+    expect(
+      mapDatabaseError({ code: "22023", message: "IDEMPOTENCY_KEY_REUSED: Start a new checkout." }),
+    ).toMatchObject({
+      code: "IDEMPOTENCY_KEY_REUSED",
+      message: "Start a new checkout.",
+    });
+    // An unknown upper-case prefix is not trusted as a code.
+    expect(mapDatabaseError({ code: "23514", message: "SOMETHING_NEW: text" }).code).toBe("RULE_VIOLATION");
+  });
+
   it("recognises EVENT_FULL and retryable failures", () => {
     expect(
       mapDatabaseError({ code: "23514", message: "EVENT_FULL: this event and its waitlist are full." }),
