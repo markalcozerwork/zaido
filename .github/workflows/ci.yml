@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  typescript:
+    name: Typecheck, format, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm test
+
+  database:
+    name: Database + contract tests (Postgres ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supabase runs Postgres 15 and 17. The schema needs 15+
+        # (ON DELETE SET NULL (column) syntax).
+        postgres: ["15", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RH_TEST_DB: rackethub_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Apply migrations and run SQL tests (incl. concurrency races)
+        run: scripts/verify-db.sh
+
+      - name: Generated database types are up to date
+        run: npm run db:types:check
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rackethub_test
+
+      - name: Zod ↔ Postgres contract tests
+        run: npm run test:contract
+        env:
+          PGDATABASE: rackethub_test

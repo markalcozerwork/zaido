@@ -11,3 +11,8 @@ supabase/.env
 # OS / editor
 .DS_Store
 *.swp
+
+# Node
+node_modules/
+coverage/
+*.tsbuildinfo

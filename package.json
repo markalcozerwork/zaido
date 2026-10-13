@@ -1,0 +1,34 @@
+{
+  "name": "rackethub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hyperlocal racket-sports community and court-booking platform for the Philippines",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:contract": "vitest run --config vitest.contract.config.ts",
+    "format": "prettier --write src tests/contract \"*.{ts,json}\"",
+    "format:check": "prettier --check src tests/contract \"*.{ts,json}\"",
+    "db:verify": "scripts/verify-db.sh",
+    "db:types": "scripts/gen-db-types.sh",
+    "db:types:check": "scripts/gen-db-types.sh --check",
+    "check": "npm run typecheck && npm run format:check && npm test"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "pg": "8.23.1",
+    "prettier": "3.9.10",
+    "supabase": "2.120.0",
+    "typescript": "6.0.3",
+    "vitest": "5.0.4"
+  }
+}
