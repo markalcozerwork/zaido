@@ -118,3 +118,10 @@ export const minutesBetween = (start: Date, end: Date): number =>
 /** Is the instant on an N-minute boundary of the UTC epoch? (PH offsets are whole hours.) */
 export const isOnMinuteGrid = (instant: Date, minutes: number): boolean =>
   instant.getTime() % (minutes * 60_000) === 0;
+
+/**
+ * Compare instants, not strings: PostgREST returns "2026-10-20T02:00:00+00:00"
+ * while Date#toISOString() gives "2026-10-20T02:00:00.000Z" for the same moment.
+ */
+export const sameInstant = (a: string | Date, b: string | Date): boolean =>
+  new Date(a).getTime() === new Date(b).getTime();

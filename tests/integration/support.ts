@@ -37,16 +37,48 @@ function postgrestFetch(postgrestUrl: string): typeof fetch {
   };
 }
 
+export interface ClientOptions {
+  /** Wrap the transport, e.g. to simulate a response lost on a flaky mobile network. */
+  wrapFetch?: (f: typeof fetch) => typeof fetch;
+}
+
 /** A supabase-js client signed in as `userId`, or anonymous when null. */
-export function clientAs(userId: string | null): DbClient {
+export function clientAs(userId: string | null, opts: ClientOptions = {}): DbClient {
   const jwt = signJwt(
     userId ? { sub: userId, role: "authenticated" } : { role: "anon" },
     inject("jwtSecret"),
   );
+  const base = postgrestFetch(inject("postgrestUrl"));
   return createClient<Database>(FAKE_SUPABASE_URL, jwt, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-    global: { fetch: postgrestFetch(inject("postgrestUrl")), headers: { Authorization: `Bearer ${jwt}` } },
+    global: {
+      fetch: opts.wrapFetch ? opts.wrapFetch(base) : base,
+      headers: { Authorization: `Bearer ${jwt}` },
+    },
   });
+}
+
+/**
+ * The request reaches the server and commits, but the client never sees the
+ * response (the first `times` matching calls throw like a dropped connection).
+ */
+export function loseResponses(match: (url: string) => boolean, times = 1) {
+  const state = { lost: 0, calls: 0 };
+  const wrap =
+    (f: typeof fetch): typeof fetch =>
+    async (input, init) => {
+      const res = await f(input, init);
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!match(url)) return res;
+      state.calls++;
+      if (state.lost < times) {
+        state.lost++;
+        await res.arrayBuffer();
+        throw new TypeError("fetch failed");
+      }
+      return res;
+    };
+  return { wrap, state };
 }
 
 // -----------------------------------------------------------------------------
@@ -99,9 +131,17 @@ export interface VenueFixture {
  * ₱100/h from 18:00, 30-minute increments, 60–240 min), weeknight peak ₱600,
  * weekend ₱700, open 06:00–24:00 daily.
  */
-export async function createVenue(
-  overrides: { timezone?: string; hours?: boolean } = {},
-): Promise<VenueFixture> {
+export interface VenueOptions {
+  timezone?: string;
+  /** false = no opening hours rows; an array = these windows instead of 06:00–24:00 daily. */
+  hours?: boolean | Array<{ day_of_week: number; opens_at: string; closes_at: string }>;
+  /** Extra venue columns (verification_status, min_lead_minutes, is_open_24h, …). */
+  venue?: Record<string, unknown>;
+  /** Extra court columns (slot_increment_minutes, …). */
+  court?: Record<string, unknown>;
+}
+
+export async function createVenue(overrides: VenueOptions = {}): Promise<VenueFixture> {
   await ensureLocations();
   const ownerId = await createUser("Venue Owner");
   const venueId = randomUUID();
@@ -118,18 +158,27 @@ export async function createVenue(
       overrides.timezone ?? "Asia/Manila",
     ],
   );
+  if (overrides.venue) await updateRow("venues", venueId, overrides.venue);
   await sql(
     `insert into public.courts (id, venue_id, name, sport, surface_type, hourly_rate, lights_fee_per_hour)
      values ($1, $2, 'Court 1', 'PICKLEBALL', 'ACRYLIC', 400, 100)`,
     [courtId, venueId],
   );
+  if (overrides.court) await updateRow("courts", courtId, overrides.court);
   await sql(
     `insert into public.court_rate_rules (court_id, label, days_of_week, start_time, end_time, hourly_rate, priority) values
        ($1, 'Weeknight peak', '{1,2,3,4,5}', '17:00', '22:00', 600, 10),
        ($1, 'Weekend', '{0,6}', '00:00', '24:00', 700, 20)`,
     [courtId],
   );
-  if (overrides.hours !== false) {
+  if (Array.isArray(overrides.hours)) {
+    for (const h of overrides.hours) {
+      await sql(
+        `insert into public.venue_operating_hours (venue_id, day_of_week, opens_at, closes_at) values ($1, $2, $3, $4)`,
+        [venueId, h.day_of_week, h.opens_at, h.closes_at],
+      );
+    }
+  } else if (overrides.hours !== false) {
     await sql(
       `insert into public.venue_operating_hours (venue_id, day_of_week, opens_at, closes_at)
        select $1, d, '06:00', '24:00' from generate_series(0, 6) d`,
@@ -138,3 +187,42 @@ export async function createVenue(
   }
   return { venueId, courtId, ownerId };
 }
+
+/** Superuser UPDATE of a few columns (trusted context: the guards' player rules don't apply). */
+export async function updateRow(table: string, id: string, values: Record<string, unknown>) {
+  const cols = Object.keys(values);
+  await sql(`update public.${table} set ${cols.map((c, i) => `${c} = $${i + 2}`).join(", ")} where id = $1`, [
+    id,
+    ...cols.map((c) => values[c]),
+  ]);
+}
+
+/** A verified pickleball coach (₱800/h), optionally with weekly availability windows. */
+export async function createCoach(
+  windows: Array<{ day_of_week: number; start_time: string; end_time: string }> = [],
+): Promise<string> {
+  const id = await createUser("Integration Coach");
+  await sql(
+    `insert into public.coach_profiles (profile_id, sports_coached, hourly_rate, verified_status) values ($1, '{PICKLEBALL}', 800, 'VERIFIED')`,
+    [id],
+  );
+  for (const w of windows) {
+    await sql(
+      `insert into public.coach_availability (coach_id, day_of_week, start_time, end_time) values ($1, $2, $3, $4)`,
+      [id, w.day_of_week, w.start_time, w.end_time],
+    );
+  }
+  return id;
+}
+
+/** An uploaded receipt object (Supabase Storage row) in the booking's own folder. */
+export async function uploadReceipt(bookingId: string, file = "gcash.png"): Promise<string> {
+  const name = `${bookingId}/${file}`;
+  await sql(`insert into storage.objects (bucket_id, name) values ('payment-receipts', $1)`, [name]);
+  return name;
+}
+
+/** A unique, valid 13-digit GCash reference. */
+let refSeq = 0;
+export const gcashRef = (): string =>
+  `9${String(Date.now() % 1e9).padStart(9, "0")}${String(++refSeq % 1000).padStart(3, "0")}`;

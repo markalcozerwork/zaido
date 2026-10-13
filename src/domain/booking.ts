@@ -158,14 +158,17 @@ export type BookingRequest = z.output<typeof bookingRequestSchema>;
  * checkout's idempotency key. The client generates the key once per checkout
  * (crypto.randomUUID()) and reuses it on every retry and double-tap, so a
  * lost response can never create a second booking.
+ *
+ * Shape only: time rules (past, lead time, horizon) are the database's, so
+ * the action returns the same typed code (SLOT_IN_PAST, TOO_SOON, …) the
+ * availability grid predicts. The form schema above keeps them for instant
+ * feedback.
  */
-export function createBookingActionSchema({ now = () => new Date() }: BookingRequestOptions = {}) {
-  return z.strictObject({ ...bookingRequestFields, idempotency_key: uuidSchema }).superRefine((b, ctx) => {
-    if (checkRequestShape(b, ctx)) checkRequestTime(b, now(), ctx);
+export const bookingActionSchema = z
+  .strictObject({ ...bookingRequestFields, idempotency_key: uuidSchema })
+  .superRefine((b, ctx) => {
+    checkRequestShape(b, ctx);
   });
-}
-
-export const bookingActionSchema = createBookingActionSchema();
 export type BookingActionInput = z.input<typeof bookingActionSchema>;
 export type BookingAction = z.output<typeof bookingActionSchema>;
 

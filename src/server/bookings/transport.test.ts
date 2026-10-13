@@ -214,13 +214,13 @@ describe("createBooking", () => {
     });
   });
 
-  it("rejects input before calling the database (no key, client-sent amounts, past times)", async () => {
+  it("rejects malformed input before calling the database (no key, client-sent amounts, off-grid times)", async () => {
     const { client, calls } = fakeRpcClient([]);
     const { idempotency_key: _key, ...noKey } = request;
     for (const bad of [
       noKey,
       { ...request, total_amount: 1 },
-      { ...request, start_time: "2026-10-12T10:00:00Z", end_time: "2026-10-12T11:00:00Z" },
+      { ...request, start_time: "2026-10-19T10:05:00Z" },
     ]) {
       expect((await createBooking(client, bad, deps)).ok).toBe(false);
     }

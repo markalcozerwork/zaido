@@ -12,7 +12,6 @@
  */
 import {
   bookingActionSchema,
-  createBookingActionSchema,
   holdEndsAt,
   staffBookingSchema,
   validate,
@@ -35,8 +34,7 @@ export async function createBooking(
   input: unknown,
   deps: ServerDeps = {},
 ): Promise<ActionResult<BookingRow>> {
-  const schema = deps.now ? createBookingActionSchema({ now: deps.now }) : bookingActionSchema;
-  const v = validate(schema, input);
+  const v = validate(bookingActionSchema, input);
   if (!v.ok) return v;
   return send(client, toCreateArgs(v.data), deps);
 }
