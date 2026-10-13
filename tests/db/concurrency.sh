@@ -253,3 +253,55 @@ for i in $(seq 1 "$N"); do
 done
 [[ "$wins" -eq 1 && "$taken" -eq $(( N - 1 )) && "$other" -eq 0 ]] || fail "create_booking race: wins=$wins slot_taken=$taken other=$other"
 echo "  ok - $N players through create_booking (distinct keys) for one slot: 1 booked, $taken clean SLOT_TAKEN, 0 deadlocks"
+
+# --- 8/9. Hold cap under concurrency -------------------------------------------
+# A venue that allows 2 unpaid holds per player.
+q >/dev/null <<SQL
+insert into auth.users (id, email) values
+  ('00000000-0000-4000-b000-000000000901', 'capper1@example.ph'),
+  ('00000000-0000-4000-b000-000000000902', 'capper2@example.ph')
+on conflict do nothing;
+insert into public.venues (id, owner_id, name, municipality_code, barangay_code, address, gcash_account_name, gcash_number,
+                           is_open_24h, verification_status, max_active_holds_per_player)
+values ('10000000-0000-4000-c000-000000000009', tests.uid('olivia'), 'Cap Courts', '9900100000', '9900100002',
+        '9 Cap Street, Pasig', 'Olivia O.', '+639170000001', true, 'VERIFIED', 2)
+on conflict do nothing;
+insert into public.courts (id, venue_id, name, sport, surface_type, hourly_rate)
+values ('20000000-0000-4000-c000-000000000901', '10000000-0000-4000-c000-000000000009', 'Cap 1', 'PICKLEBALL', 'ACRYLIC', 300)
+on conflict do nothing;
+SQL
+CAPC='20000000-0000-4000-c000-000000000901'
+# 8. capper1 already holds cap-1 slots, then double-taps one checkout N times.
+q >/dev/null -c "set role authenticated" -c "select tests.login('00000000-0000-4000-b000-000000000901'::uuid)" \
+  -c "select id from public.create_booking('$CAPC', tests.slot(9, '06:00'), tests.slot(9, '07:00'), 'GCASH', p_idempotency_key => gen_random_uuid())"
+KEY="bbbbbbbb-0000-4000-a000-$(printf '%012d' 8)"
+GO="$(start_at)"
+for i in $(seq 1 "$N"); do
+  ( set +e
+    q -At -c "set role authenticated" -c "select tests.login('00000000-0000-4000-b000-000000000901'::uuid)" -c "$(barrier "$GO")" \
+      -c "select id from public.create_booking('$CAPC', tests.slot(9, '08:00'), tests.slot(9, '09:00'), 'GCASH', p_idempotency_key => '$KEY')" \
+      >"$WORK/cap.$i.out" 2>&1; echo $? >"$WORK/cap.$i.rc" ) &
+done
+wait
+ids=$(for i in $(seq 1 "$N"); do [[ "$(cat "$WORK/cap.$i.rc")" == 0 ]] && grep -E '^[0-9a-f-]{36}$' "$WORK/cap.$i.out"; done | sort -u)
+okcalls=$(for i in $(seq 1 "$N"); do cat "$WORK/cap.$i.rc"; done | grep -cx 0 || true)
+capped=$(grep -l 'HOLD_LIMIT_REACHED' "$WORK"/cap.*.out 2>/dev/null | wc -l || true)
+[[ "$okcalls" -eq "$N" && "$(echo "$ids" | wc -l)" -eq 1 && "$capped" -eq 0 ]] \
+  || { for i in $(seq 1 "$N"); do sed 's/^/    /' "$WORK/cap.$i.out"; done | sort | uniq -c | head; fail "cap double-tap: ok=$okcalls ids=$(echo "$ids" | wc -l) capped=$capped"; }
+echo "  ok - $N double-taps of one checkout at hold cap - 1: all succeeded with one id, none tripped HOLD_LIMIT_REACHED"
+
+# 9. capper2 (no holds) fires N different checkouts for N different slots at once.
+GO="$(start_at)"
+for i in $(seq 1 "$N"); do
+  ( set +e
+    q -At -c "set role authenticated" -c "select tests.login('00000000-0000-4000-b000-000000000902'::uuid)" -c "$(barrier "$GO")" \
+      -c "select id from public.create_booking('$CAPC', tests.slot(10, '00:00') + make_interval(hours => $i), tests.slot(10, '00:00') + make_interval(hours => $i + 1), 'GCASH', p_idempotency_key => gen_random_uuid())" \
+      >"$WORK/cap2.$i.out" 2>&1; echo $? >"$WORK/cap2.$i.rc" ) &
+done
+wait
+okcalls=$(for i in $(seq 1 "$N"); do cat "$WORK/cap2.$i.rc"; done | grep -cx 0 || true)
+capped=$(grep -l 'HOLD_LIMIT_REACHED' "$WORK"/cap2.*.out 2>/dev/null | wc -l || true)
+held=$(qa -c "select count(*) from public.bookings where booked_by = '00000000-0000-4000-b000-000000000902' and booking_status = 'PENDING_PAYMENT'")
+[[ "$okcalls" -eq 2 && "$capped" -eq $(( N - 2 )) && "$held" -eq 2 ]] \
+  || { for i in $(seq 1 "$N"); do sed 's/^/    /' "$WORK/cap2.$i.out"; done | sort | uniq -c | head; fail "hold cap race: ok=$okcalls capped=$capped held=$held"; }
+echo "  ok - $N simultaneous checkouts by one player at a 2-hold venue: exactly 2 holds, $capped HOLD_LIMIT_REACHED"

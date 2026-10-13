@@ -63,10 +63,21 @@ select tests.eq(
 
 select tests.ok(not (select prosecdef from pg_proc where oid = 'public.create_booking'::regproc),
                 'create_booking stays SECURITY INVOKER (a DEFINER version would bypass every guard rule)');
+select tests.ok(not exists (select 1 from pg_proc p, unnest(p.proconfig) c
+                             where p.oid = 'public.create_booking'::regproc and c ilike '%isolation%'),
+                'create_booking runs at the caller''s isolation (its twin detection relies on READ COMMITTED)');
+select tests.ok(not has_table_privilege('authenticated', 'app.coach_commitments', 'select')
+                and not has_table_privilege('anon', 'app.coach_commitments', 'select'),
+                'the coach ledger is not readable by API roles');
+select tests.ok(to_regclass('realtime.messages') is null
+                or exists (select 1 from pg_policies where schemaname = 'realtime' and tablename = 'messages'
+                             and policyname = 'court slot topics are receivable'),
+                'the court-slot receive policy exists wherever Realtime does');
 
 select tests.eq(
   (select string_agg(t, ', ') from unnest(array[
       'bookings_guard', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
-      'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments']) as t
+      'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments',
+      'court_closures_stamp', 'court_closures_broadcast']) as t
     where not exists (select 1 from pg_trigger g where g.tgname = t and not g.tgisinternal)),
   null, 'booking-engine triggers are installed');

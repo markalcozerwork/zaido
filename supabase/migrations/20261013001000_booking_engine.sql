@@ -83,6 +83,11 @@ comment on column public.venues.booking_horizon_days is 'Players can book up to 
 comment on column public.venues.is_open_24h is
   'Explicit 24/7 flag. Without it, a venue that has not published opening hours takes no player bookings.';
 
+-- Venues that never set hours were bookable around the clock before this
+-- migration; keep them that way. New venues must set hours or opt in.
+update public.venues v set is_open_24h = true
+ where not exists (select 1 from public.venue_operating_hours h where h.venue_id = v.id);
+
 -- How long after payment_due_at an unpaid hold is really dead. Every place
 -- that decides "is this hold still alive?" uses this one value (sweeps, busy
 -- slots, hold cap, late proofs), so the grid and the guard always agree.
@@ -104,7 +109,7 @@ create table public.court_closures (
   starts_at   timestamptz not null,
   ends_at     timestamptz not null,
   reason      text not null,
-  created_by  uuid references public.profiles (id) on delete set null,
+  created_by  uuid default auth.uid() references public.profiles (id) on delete set null,
   created_at  timestamptz not null default now(),
   constraint court_closures_court_fk foreign key (venue_id, court_id)
     references public.courts (venue_id, id) on delete cascade,
@@ -125,7 +130,30 @@ create policy "court_closures: public read"
 create policy "court_closures: venue staff manage"
   on public.court_closures for all to authenticated
   using (app.is_venue_manager(venue_id))
-  with check (app.is_venue_manager(venue_id) and created_by = (select auth.uid()));
+  with check (app.is_venue_manager(venue_id));
+
+-- Who created a closure is recorded by the database, never taken from the client.
+create or replace function app.tg_court_closures_stamp()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if not app.is_trusted_context() then
+    if tg_op = 'INSERT' then
+      new.created_by := auth.uid();
+    else
+      new.created_by := old.created_by;
+      new.created_at := old.created_at;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger court_closures_stamp
+  before insert or update on public.court_closures
+  for each row execute function app.tg_court_closures_stamp();
 
 revoke truncate, references, trigger on public.court_closures from anon, authenticated;
 revoke insert, update, delete on public.court_closures from anon;
@@ -641,7 +669,7 @@ begin
       new.total_amount    := case when app.is_trusted_context() then coalesce(new.total_amount,
                                       new.court_amount + new.lights_amount + new.coach_amount - new.discount_amount)
                                   else new.court_amount + new.lights_amount + new.coach_amount - new.discount_amount end;
-      if new.booking_status = 'PENDING_PAYMENT' and new.payment_method <> 'CASH_ON_COURT' then
+      if new.booking_status = 'PENDING_PAYMENT' and new.payment_method <> 'CASH_ON_COURT' and new.payment_status <> 'PAID' then
         new.payment_due_at := coalesce(new.payment_due_at, now() + make_interval(mins => r.payment_window_minutes));
       end if;
     end if;
@@ -921,6 +949,75 @@ revoke all on app.coach_commitments from public;
 comment on table app.coach_commitments is
   'Every live claim on a coach''s time (coached bookings, coach-confirmed events). The EXCLUDE constraint is the single source of truth for coach double-booking.';
 
+-- One function decides what a source's ledger row should be, from the current
+-- table state; the triggers just ask it to re-sync the sources they touched.
+--   BOOKING: live while not cancelled. Always keeps its row, including when it
+--            is the court booking of its own coach's event.
+--   EVENT:   live once SCHEDULED/IN_PROGRESS with the coach's confirmation,
+--            unless its linked booking already commits the same coach over
+--            the whole event (the booking's row covers it).
+create or replace function app.sync_coach_commitment(p_kind text, p_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_coach   uuid;
+  v_range   tstzrange;
+  v_current app.coach_commitments;
+begin
+  if p_kind = 'BOOKING' then
+    select b.coach_id, b.time_range into v_coach, v_range
+      from public.bookings b
+     where b.id = p_id and b.coach_id is not null and b.booking_status <> 'CANCELLED';
+  else
+    select e.coach_id, tstzrange(e.start_time, e.end_time, '[)') into v_coach, v_range
+      from public.events e
+     where e.id = p_id
+       and e.coach_id is not null
+       and e.coach_confirmed_at is not null
+       and e.status in ('SCHEDULED', 'IN_PROGRESS')
+       and not exists (
+             select 1 from public.bookings b
+              where b.id = e.booking_id
+                and b.coach_id = e.coach_id
+                and b.booking_status <> 'CANCELLED'
+                and b.time_range @> tstzrange(e.start_time, e.end_time, '[)'));
+  end if;
+
+  select * into v_current from app.coach_commitments c where c.source_kind = p_kind and c.source_id = p_id;
+
+  -- Unchanged: touch nothing, so sweeps that only flip statuses never re-check
+  -- (and never trip over) clashes left over from before the ledger existed.
+  if v_current.source_id is not null and v_current.coach_id = v_coach and v_current.time_range = v_range then
+    return;
+  end if;
+
+  if v_current.source_id is not null then
+    delete from app.coach_commitments c where c.source_kind = p_kind and c.source_id = p_id;
+  end if;
+  if v_coach is null then
+    return;
+  end if;
+
+  -- An event going live over the coach's dead-but-unswept hold must not fail.
+  -- (Bookings already expire overlapping holds in the guard.)
+  if p_kind = 'EVENT' then
+    perform app.expire_overlapping_holds(null, v_coach, lower(v_range), upper(v_range));
+  end if;
+
+  begin
+    insert into app.coach_commitments (source_kind, source_id, coach_id, time_range)
+    values (p_kind, p_id, v_coach, v_range);
+  exception when exclusion_violation then
+    -- Re-raise without the DETAIL (which would expose the coach's other commitment).
+    raise exception using errcode = '23P01', constraint = 'coach_commitments_no_overlap',
+      message = 'COACH_UNAVAILABLE: This coach is already booked at that time.';
+  end;
+end;
+$$;
+
 create or replace function app.tg_sync_coach_commitments()
 returns trigger
 language plpgsql
@@ -928,51 +1025,53 @@ security definer
 set search_path = ''
 as $$
 declare
-  v_kind  text := case tg_table_name when 'bookings' then 'BOOKING' else 'EVENT' end;
-  v_id    uuid;
-  v_live  boolean := false;
+  v_id    uuid := case when tg_op = 'DELETE' then old.id else new.id end;
+  v_event uuid;
 begin
-  if tg_op = 'DELETE' then
-    v_id := old.id;
-  else
-    v_id := new.id;
+  -- Status flips that leave the commitment as it was (CONFIRMED → COMPLETED,
+  -- SCHEDULED → IN_PROGRESS) skip the ledger entirely, so the multi-row sweeps
+  -- never re-check, or abort on, a clash that predates the ledger.
+  if tg_op = 'UPDATE' then
     if tg_table_name = 'bookings' then
-      -- A coached booking that is the court booking of that coach's own event is covered by the event.
-      v_live := new.coach_id is not null
-            and new.booking_status <> 'CANCELLED'
-            and not (new.reserved_for_event_id is not null and exists (
-                  select 1 from public.events e where e.id = new.reserved_for_event_id and e.coach_id = new.coach_id));
-    else
-      v_live := new.coach_id is not null
-            and new.coach_confirmed_at is not null
-            and new.status in ('SCHEDULED', 'IN_PROGRESS');
+      if new.coach_id is not distinct from old.coach_id
+         and new.start_time = old.start_time and new.end_time = old.end_time
+         and (new.booking_status = 'CANCELLED') = (old.booking_status = 'CANCELLED') then
+        return null;
+      end if;
+    elsif new.coach_id is not distinct from old.coach_id
+          and new.start_time = old.start_time and new.end_time = old.end_time
+          and new.booking_id is not distinct from old.booking_id
+          and (new.coach_confirmed_at is null) = (old.coach_confirmed_at is null)
+          and (new.status in ('SCHEDULED', 'IN_PROGRESS')) = (old.status in ('SCHEDULED', 'IN_PROGRESS')) then
+      return null;
     end if;
   end if;
 
-  delete from app.coach_commitments c where c.source_kind = v_kind and c.source_id = v_id;
-
-  if v_live then
-    begin
-      insert into app.coach_commitments (source_kind, source_id, coach_id, time_range)
-      values (v_kind, v_id, new.coach_id, tstzrange(new.start_time, new.end_time, '[)'));
-    exception when exclusion_violation then
-      -- Re-raise without the DETAIL (which would expose the coach's other commitment).
-      raise exception using errcode = '23P01', constraint = 'coach_commitments_no_overlap',
-        message = 'COACH_UNAVAILABLE: This coach is already booked at that time.';
-    end;
+  if tg_table_name = 'bookings' then
+    perform app.sync_coach_commitment('BOOKING', v_id);
+    -- The event this booking covers may need its own row back (booking
+    -- cancelled or moved by a trusted actor), or no longer need it.
+    v_event := case when tg_op = 'DELETE' then old.reserved_for_event_id else new.reserved_for_event_id end;
+    if v_event is not null then
+      perform app.sync_coach_commitment('EVENT', v_event);
+    end if;
+  else
+    perform app.sync_coach_commitment('EVENT', v_id);
   end if;
   return null;
 end;
 $$;
 
 -- AFTER triggers see the final row (after every BEFORE guard rewrote it).
+-- reserved_for_event_id is not in the list: linking never changes a booking's
+-- own commitment, and the event side re-syncs itself on booking_id changes.
 create trigger bookings_40_coach_commitments
-  after insert or update of coach_id, start_time, end_time, booking_status, reserved_for_event_id or delete
+  after insert or update of coach_id, start_time, end_time, booking_status or delete
   on public.bookings
   for each row execute function app.tg_sync_coach_commitments();
 
 create trigger events_40_coach_commitments
-  after insert or update of coach_id, coach_confirmed_at, start_time, end_time, status or delete
+  after insert or update of coach_id, coach_confirmed_at, start_time, end_time, status, booking_id or delete
   on public.events
   for each row execute function app.tg_sync_coach_commitments();
 
@@ -987,6 +1086,9 @@ begin
     union all
     select 'EVENT', e.id, e.coach_id, tstzrange(e.start_time, e.end_time, '[)') from public.events e
      where e.coach_id is not null and e.coach_confirmed_at is not null and e.status in ('SCHEDULED', 'IN_PROGRESS')
+       and not exists (select 1 from public.bookings b
+                        where b.id = e.booking_id and b.coach_id = e.coach_id and b.booking_status <> 'CANCELLED'
+                          and b.time_range @> tstzrange(e.start_time, e.end_time, '[)'))
   loop
     begin
       insert into app.coach_commitments (source_kind, source_id, coach_id, time_range)
@@ -1078,8 +1180,12 @@ begin
     raise exception using errcode = '42501', message = 'Only venue staff can mark a booking as paid.';
   end if;
 
-  -- Fast path for a retry whose first attempt already committed.
+  -- Fast path for a retry whose first attempt already committed. Twins with the
+  -- same key queue on this lock (taken before the guard's hold-cap lock, so the
+  -- order is always idempotency → holds → rows) and the second one finds the
+  -- first's row instead of tripping the hold cap or the slot constraint.
   if p_idempotency_key is not null then
+    perform pg_advisory_xact_lock(hashtextextended('rackethub:idem:' || v_actor::text || ':' || p_idempotency_key::text, 0));
     select * into v_row from public.bookings b
      where b.created_by = v_actor and b.idempotency_key = p_idempotency_key;
   end if;
@@ -1093,15 +1199,13 @@ begin
     begin
       insert into public.bookings (
         court_id, booked_by, coach_id, start_time, end_time, payment_method, payment_ref_no,
-        player_count, notes, idempotency_key, walk_in_name, walk_in_phone, discount_amount
+        player_count, notes, idempotency_key, walk_in_name, walk_in_phone, discount_amount, payment_status
       ) values (
         p_court_id, coalesce(p_booked_by, v_actor), p_coach_id, p_start, p_end, p_payment_method, p_payment_ref_no,
-        p_player_count, p_notes, p_idempotency_key, p_walk_in_name, p_walk_in_phone, p_discount_amount
+        p_player_count, p_notes, p_idempotency_key, p_walk_in_name, p_walk_in_phone, p_discount_amount,
+        case when p_mark_paid then 'PAID' else 'UNPAID' end::public.payment_status
       )
       returning * into v_row;
-      if p_mark_paid and v_row.payment_status <> 'PAID' then
-        update public.bookings set payment_status = 'PAID' where id = v_row.id returning * into v_row;
-      end if;
       return v_row;
     exception when unique_violation or exclusion_violation then
       -- A concurrent twin with our key committed first: under READ COMMITTED this
@@ -1279,9 +1383,14 @@ declare
   v_new_busy boolean := tg_op <> 'DELETE' and new.booking_status <> 'CANCELLED';
   v_moved    boolean := tg_op = 'UPDATE'
                         and (new.court_id <> old.court_id or new.start_time <> old.start_time or new.end_time <> old.end_time);
-  -- A hold that gets paid stays busy but stops being a HOLD: re-announce it.
-  v_settled  boolean := tg_op = 'UPDATE' and v_new_busy and v_old_busy
-                        and old.payment_status in ('UNPAID', 'REJECTED') and new.payment_status not in ('UNPAID', 'REJECTED');
+  -- held_until changes (paid, proof submitted, proof rejected → new window):
+  -- the slot stays busy but its kind/expiry changed, so re-announce it.
+  v_old_held timestamptz := case when tg_op <> 'INSERT' and old.booking_status = 'PENDING_PAYMENT'
+                                      and old.payment_status in ('UNPAID', 'REJECTED')
+                                 then old.payment_due_at + app.hold_grace() end;
+  v_new_held timestamptz := case when tg_op <> 'DELETE' and new.booking_status = 'PENDING_PAYMENT'
+                                      and new.payment_status in ('UNPAID', 'REJECTED')
+                                 then new.payment_due_at + app.hold_grace() end;
 begin
   -- Runs on every Supabase project. Test databases without Realtime skip it.
   if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is null then
@@ -1293,11 +1402,10 @@ begin
       jsonb_build_object('court_id', old.court_id, 'start_time', old.start_time, 'end_time', old.end_time, 'busy', false),
       'slot_changed', 'court:' || old.court_id || ':slots', true);
   end if;
-  if v_new_busy and (not v_old_busy or v_moved or v_settled) then
+  if v_new_busy and (not v_old_busy or v_moved or v_old_held is distinct from v_new_held) then
     perform realtime.send(
       jsonb_build_object('court_id', new.court_id, 'start_time', new.start_time, 'end_time', new.end_time, 'busy', true,
-                         'held_until', case when new.booking_status = 'PENDING_PAYMENT' and new.payment_status in ('UNPAID', 'REJECTED')
-                                            then new.payment_due_at + app.hold_grace() end),
+                         'held_until', v_new_held),
       'slot_changed', 'court:' || new.court_id || ':slots', true);
   end if;
   return null;
@@ -1305,7 +1413,7 @@ end;
 $$;
 
 create trigger bookings_50_broadcast_slots
-  after insert or update of court_id, start_time, end_time, booking_status, payment_status or delete on public.bookings
+  after insert or update of court_id, start_time, end_time, booking_status, payment_status, payment_due_at or delete on public.bookings
   for each row execute function app.tg_broadcast_court_slots();
 
 -- Closures change availability too; notify every affected court's topic.
@@ -1316,26 +1424,35 @@ security definer
 set search_path = ''
 as $$
 declare
-  k record;
   c record;
 begin
   if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is null then
     return null;
   end if;
-  k := case when tg_op = 'DELETE' then old else new end;
-  for c in
-    select ct.id from public.courts ct where ct.venue_id = k.venue_id and (k.court_id is null or ct.id = k.court_id)
-  loop
-    perform realtime.send(
-      jsonb_build_object('court_id', c.id, 'start_time', k.starts_at, 'end_time', k.ends_at, 'busy', tg_op <> 'DELETE'),
-      'slot_changed', 'court:' || c.id || ':slots', true);
-  end loop;
+  if tg_op in ('UPDATE', 'DELETE') then
+    for c in
+      select ct.id from public.courts ct where ct.venue_id = old.venue_id and (old.court_id is null or ct.id = old.court_id)
+    loop
+      perform realtime.send(
+        jsonb_build_object('court_id', c.id, 'start_time', old.starts_at, 'end_time', old.ends_at, 'busy', false),
+        'slot_changed', 'court:' || c.id || ':slots', true);
+    end loop;
+  end if;
+  if tg_op in ('INSERT', 'UPDATE') then
+    for c in
+      select ct.id from public.courts ct where ct.venue_id = new.venue_id and (new.court_id is null or ct.id = new.court_id)
+    loop
+      perform realtime.send(
+        jsonb_build_object('court_id', c.id, 'start_time', new.starts_at, 'end_time', new.ends_at, 'busy', true),
+        'slot_changed', 'court:' || c.id || ':slots', true);
+    end loop;
+  end if;
   return null;
 end;
 $$;
 
 create trigger court_closures_broadcast
-  after insert or delete on public.court_closures
+  after insert or update or delete on public.court_closures
   for each row execute function app.tg_broadcast_closures();
 
 -- Anyone may RECEIVE court slot broadcasts. There's no INSERT policy, so no
@@ -1350,7 +1467,7 @@ begin
         using (realtime.messages.extension = 'broadcast' and realtime.topic() like 'court:%:slots')
     $p$;
   else
-    raise notice 'realtime.messages not found; skipping broadcast authorization policy.';
+    raise warning 'realtime.messages not found; skipping the broadcast authorization policy. Clients will not receive slot updates.';
   end if;
 end;
 $$;
@@ -1375,6 +1492,8 @@ revoke execute on function app.expire_unpaid_bookings(uuid) from authenticated;
 
 -- Coaches confirm their events by updating this one column.
 grant update (coach_confirmed_at) on public.events to authenticated;
+-- Staff fix walk-in typos (the guard keeps players out of these columns).
+grant update (walk_in_name, walk_in_phone) on public.bookings to authenticated;
 
 -- Close the PUBLIC execute default on everything this migration defined in app.*
 revoke execute on all functions in schema app from public;

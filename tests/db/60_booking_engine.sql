@@ -391,3 +391,140 @@ select tests.ok(not exists (select 1 from realtime.messages where event = 'probe
                 'but not on any other private topic');
 reset role;
 select set_config('realtime.topic', '', false);
+
+-- =============================================================================
+-- Step 3, round 3: covered clinics, sweeps vs. old clashes, single-write
+-- mark-paid, closures, walk-in edits, hold re-announcements
+-- =============================================================================
+set role authenticated;
+
+-- A clinic run on its coach's own court booking: the booking commits the coach
+-- for its whole range; the event adds nothing, and can still be cancelled.
+select tests.login('olivia');
+select id as cov_booking from public.create_booking(:c2, tests.slot(8, '09:00'), tests.slot(8, '12:00'), 'CASH_ON_COURT',
+                                                    p_coach_id => tests.uid('carlos')) \gset
+insert into public.events (id, venue_id, court_id, booking_id, coach_id, organizer_id, title, sport, event_type, status,
+                           start_time, end_time, max_participants)
+values ('50000000-0000-4000-a000-000000000081', '10000000-0000-4000-a000-000000000001', :c2, :'cov_booking', tests.uid('carlos'),
+        tests.uid('olivia'), 'Covered clinic', 'PICKLEBALL', 'CLINIC', 'DRAFT', tests.slot(8, '09:30'), tests.slot(8, '11:30'), 8);
+select tests.login('carlos');
+update public.events set coach_confirmed_at = now() where id = '50000000-0000-4000-a000-000000000081';
+select tests.login('olivia');
+update public.events set status = 'SCHEDULED' where id = '50000000-0000-4000-a000-000000000081';
+select tests.ok(true, 'a clinic can go live on its own coach''s court booking');
+reset role;
+select tests.eq((select string_agg(source_kind, ',' order by source_kind) from app.coach_commitments
+                  where source_id in (:'cov_booking', '50000000-0000-4000-a000-000000000081')),
+                'BOOKING', 'the covering booking holds the coach; the covered event adds no second row');
+set role authenticated;
+select tests.login('erin');
+select tests.throws(format($$ select * from public.create_booking(%L, tests.slot(8, '11:30'), tests.slot(8, '12:30'), 'CASH_ON_COURT',
+                                                                 p_coach_id => tests.uid('carlos')) $$, :c1),
+                    '23P01', 'the coach stays committed for the part of the booking outside the event');
+select tests.login('olivia');
+update public.events set status = 'CANCELLED' where id = '50000000-0000-4000-a000-000000000081';
+select tests.ok(true, 'the covered clinic can be cancelled');
+reset role;
+select tests.eq((select count(*) from app.coach_commitments where source_id = :'cov_booking')::int, 1,
+                'after the event is cancelled the booking still commits the coach');
+select tests.eq((select reserved_for_event_id from public.bookings where id = :'cov_booking'), null::uuid,
+                'cancelling the event releases its court booking');
+
+-- A trusted actor cancelling a covering booking puts the event's own row back.
+set role authenticated;
+select tests.login('olivia');
+select id as cov2 from public.create_booking(:c2, tests.slot(8, '14:00'), tests.slot(8, '16:00'), 'CASH_ON_COURT',
+                                             p_coach_id => tests.uid('carlos')) \gset
+insert into public.events (id, venue_id, court_id, booking_id, coach_id, organizer_id, title, sport, event_type, status,
+                           start_time, end_time, max_participants)
+values ('50000000-0000-4000-a000-000000000082', '10000000-0000-4000-a000-000000000001', :c2, :'cov2', tests.uid('carlos'),
+        tests.uid('olivia'), 'Covered clinic 2', 'PICKLEBALL', 'CLINIC', 'DRAFT', tests.slot(8, '14:00'), tests.slot(8, '16:00'), 8);
+select tests.login('carlos');
+update public.events set coach_confirmed_at = now() where id = '50000000-0000-4000-a000-000000000082';
+select tests.login('olivia');
+update public.events set status = 'SCHEDULED' where id = '50000000-0000-4000-a000-000000000082';
+reset role;
+update public.bookings set booking_status = 'CANCELLED', cancellation_reason = 'VENUE_CANCELLED' where id = :'cov2';
+select tests.eq((select string_agg(source_kind, ',') from app.coach_commitments
+                  where source_id in (:'cov2', '50000000-0000-4000-a000-000000000082')),
+                'EVENT', 'when its covering booking is cancelled, the live event commits the coach itself');
+
+-- A clash that predates the ledger (no ledger row) must not abort the sweeps.
+alter table public.bookings disable trigger bookings_40_coach_commitments;
+insert into public.bookings (id, court_id, booked_by, coach_id, start_time, end_time, payment_method, booking_status)
+values ('30000000-0000-4000-a000-000000000083', :c1, tests.uid('bob'), tests.uid('carlos'),
+        tests.slot(8, '14:30'), tests.slot(8, '15:30'), 'CASH_ON_COURT', 'CONFIRMED');
+alter table public.bookings enable trigger bookings_40_coach_commitments;
+update public.bookings set payment_status = 'PAID', booking_status = 'COMPLETED' where id = '30000000-0000-4000-a000-000000000083';
+select tests.ok(true, 'a status flip on an old clashing booking leaves the ledger alone (sweeps cannot abort on it)');
+
+-- An event going live over the coach's dead-but-unswept hold expires the hold.
+insert into public.bookings (id, court_id, booked_by, coach_id, start_time, end_time, payment_method, payment_due_at)
+values ('30000000-0000-4000-a000-000000000084', :c1, tests.uid('bob'), tests.uid('carlos'),
+        tests.slot(8, '18:00'), tests.slot(8, '19:00'), 'GCASH', now() - interval '10 minutes');
+insert into public.events (id, coach_id, organizer_id, municipality_code, title, sport, event_type, status, coach_confirmed_at,
+                           start_time, end_time, max_participants)
+values ('50000000-0000-4000-a000-000000000084', tests.uid('carlos'), tests.uid('carlos'), '9900100000', 'Park clinic',
+        'PICKLEBALL', 'CLINIC', 'DRAFT', now(), tests.slot(8, '18:00'), tests.slot(8, '20:00'), 8);
+set role authenticated;
+select tests.login('carlos');
+update public.events set status = 'SCHEDULED' where id = '50000000-0000-4000-a000-000000000084';
+reset role;
+select tests.eq((select booking_status::text || '/' || cancellation_reason::text from public.bookings where id = '30000000-0000-4000-a000-000000000084'),
+                'CANCELLED/PAYMENT_WINDOW_EXPIRED',
+                'publishing a clinic over the coach''s expired hold expires the hold instead of failing');
+
+-- A rejected proof re-opens the hold with a new expiry: announced to the grid.
+set role authenticated;
+select tests.login('olivia');
+update public.bookings set payment_status = 'REJECTED', payment_rejection_reason = 'Reference not found'
+ where id = '30000000-0000-4000-a000-000000000077';
+reset role;
+select tests.ok(exists (select 1 from realtime.messages m, public.bookings b
+                         where b.id = '30000000-0000-4000-a000-000000000077'
+                           and m.topic = 'court:' || b.court_id || ':slots'
+                           and (m.payload->>'busy')::boolean
+                           and (m.payload->>'held_until')::timestamptz = b.payment_due_at + app.hold_grace()),
+                'a rejected proof re-announces the slot as a hold with its new expiry');
+
+-- Front desk mark-paid is one write: one history row, verified, no payment window.
+set role authenticated;
+select tests.login('mia');
+select id as gcash_now from public.create_booking(:c2, tests.slot(6, '19:00'), tests.slot(6, '20:00'), 'GCASH',
+                                                  p_walk_in_name => 'Kuya Ben', p_walk_in_phone => '+639171234567',
+                                                  p_payment_ref_no => '9100000000099', p_mark_paid => true) \gset
+reset role;
+select tests.eq((select booking_status::text || '/' || payment_status::text || '/' || (payment_verified_at is not null)::text
+                        || '/' || coalesce(payment_due_at::text, 'none')
+                   from public.bookings where id = :'gcash_now'),
+                'CONFIRMED/PAID/true/none', 'a desk e-wallet payment is confirmed and verified with no payment window');
+select tests.eq((select count(*) from public.booking_status_history where booking_id = :'gcash_now')::int, 1,
+                'mark-paid writes the booking once (a single history entry)');
+
+-- Walk-in typos: staff fix them, players can't touch them.
+set role authenticated;
+select tests.login('mia');
+update public.bookings set walk_in_name = 'Kuya Benjie' where id = :'gcash_now';
+select tests.eq((select walk_in_name from public.bookings where id = :'gcash_now'), 'Kuya Benjie', 'staff can correct a walk-in name');
+select tests.login('alice');
+select tests.throws(format($$ update public.bookings set walk_in_name = 'Me' where id = %L $$, :'b1'),
+                    '42501', 'players cannot set walk-in details');
+
+-- Closures: creator recorded by the database; any staff member can edit; edits are broadcast.
+select tests.login('mia');
+insert into public.court_closures (id, venue_id, court_id, starts_at, ends_at, reason, created_by)
+values ('60000000-0000-4000-a000-000000000085', '10000000-0000-4000-a000-000000000001', :c2,
+        tests.slot(8, '06:00'), tests.slot(8, '08:00'), 'Resurfacing', tests.uid('alice'));
+select tests.login('olivia');
+update public.court_closures set ends_at = tests.slot(8, '08:30'), reason = 'Resurfacing (extended)'
+ where id = '60000000-0000-4000-a000-000000000085';
+reset role;
+select tests.eq((select created_by from public.court_closures where id = '60000000-0000-4000-a000-000000000085'), tests.uid('mia'),
+                'a closure''s creator is stamped by the database and survives edits by other staff');
+select tests.ok(exists (select 1 from realtime.messages
+                         where topic = 'court:' || :c2 || ':slots' and not (payload->>'busy')::boolean
+                           and (payload->>'end_time')::timestamptz = tests.slot(8, '08:00'))
+                and exists (select 1 from realtime.messages
+                             where topic = 'court:' || :c2 || ':slots' and (payload->>'busy')::boolean
+                               and (payload->>'end_time')::timestamptz = tests.slot(8, '08:30')),
+                'editing a closure announces the old range free and the new range closed');
