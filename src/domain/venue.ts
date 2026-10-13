@@ -75,6 +75,27 @@ const venueFields = {
     })
     .optional(),
   timezone: z.string().refine(isValidTimeZone, { error: "Unknown time zone." }).optional(),
+  // Booking policy (Step 3)
+  min_lead_minutes: z
+    .number()
+    .int()
+    .min(LIMITS.venue.minLeadMinutes.min)
+    .max(LIMITS.venue.minLeadMinutes.max, { error: "The minimum lead time can be at most 24 hours." })
+    .optional(),
+  booking_horizon_days: z
+    .number()
+    .int()
+    .min(LIMITS.venue.bookingHorizonDays.min, { error: "Let players book at least 1 day ahead." })
+    .max(LIMITS.venue.bookingHorizonDays.max, { error: "Bookings can open at most 90 days ahead." })
+    .optional(),
+  max_active_holds_per_player: z
+    .number()
+    .int()
+    .min(LIMITS.venue.maxActiveHoldsPerPlayer.min, { error: "Allow at least 1 unpaid booking." })
+    .max(LIMITS.venue.maxActiveHoldsPerPlayer.max, { error: "Allow at most 50 unpaid bookings." })
+    .optional(),
+  /** Without opening hours a venue takes no player bookings unless it is explicitly open 24/7. */
+  is_open_24h: z.boolean().optional(),
 };
 
 interface VenuePaymentShape {
@@ -182,6 +203,10 @@ export function toVenueInsert(ownerId: string, v: VenueCreate): InsertRow<"venue
     payment_window_minutes: v.payment_window_minutes,
     cancellation_cutoff_hours: v.cancellation_cutoff_hours,
     timezone: v.timezone,
+    min_lead_minutes: v.min_lead_minutes,
+    booking_horizon_days: v.booking_horizon_days,
+    max_active_holds_per_player: v.max_active_holds_per_player,
+    is_open_24h: v.is_open_24h,
   });
 }
 
@@ -213,12 +238,16 @@ export function toVenueUpdate(patch: VenueUpdate): UpdateRow<"venues"> {
     payment_window_minutes: patch.payment_window_minutes,
     cancellation_cutoff_hours: patch.cancellation_cutoff_hours,
     timezone: patch.timezone,
+    min_lead_minutes: patch.min_lead_minutes,
+    booking_horizon_days: patch.booking_horizon_days,
+    max_active_holds_per_player: patch.max_active_holds_per_player,
+    is_open_24h: patch.is_open_24h,
     is_active: patch.is_active,
   });
 }
 
 // -----------------------------------------------------------------------------
-// Opening hours (a venue with no rows is open 24/7)
+// Opening hours (a venue with no rows takes player bookings only if is_open_24h)
 // -----------------------------------------------------------------------------
 export const operatingWindowSchema = z
   .strictObject({

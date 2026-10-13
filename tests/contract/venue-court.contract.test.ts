@@ -55,6 +55,10 @@ const venueInput = {
   payment_window_minutes: 1440,
   cancellation_cutoff_hours: 168,
   timezone: "Asia/Manila",
+  min_lead_minutes: 1440,
+  booking_horizon_days: 90,
+  max_active_holds_per_player: 50,
+  is_open_24h: true,
 };
 
 async function ownerWithVenue() {
@@ -215,6 +219,36 @@ describe("completeness: what the database rejects, Zod rejects", () => {
       name: "payment window 1441 minutes",
       zod: () => venueCreateSchema.safeParse(v({ payment_window_minutes: 1441 })).success,
       db: () => insertSql("venues", venueRow({ payment_window_minutes: 1441 })),
+    },
+    {
+      name: "minimum lead time 1441 minutes",
+      zod: () => venueCreateSchema.safeParse(v({ min_lead_minutes: 1441 })).success,
+      db: () => insertSql("venues", venueRow({ min_lead_minutes: 1441 })),
+    },
+    {
+      name: "booking horizon 0 days",
+      zod: () => venueCreateSchema.safeParse(v({ booking_horizon_days: 0 })).success,
+      db: () => insertSql("venues", venueRow({ booking_horizon_days: 0 })),
+    },
+    {
+      name: "booking horizon 91 days",
+      zod: () => venueCreateSchema.safeParse(v({ booking_horizon_days: 91 })).success,
+      db: () => insertSql("venues", venueRow({ booking_horizon_days: 91 })),
+    },
+    {
+      name: "hold cap 0",
+      zod: () => venueCreateSchema.safeParse(v({ max_active_holds_per_player: 0 })).success,
+      db: () => insertSql("venues", venueRow({ max_active_holds_per_player: 0 })),
+    },
+    {
+      name: "hold cap 51",
+      zod: () => venueCreateSchema.safeParse(v({ max_active_holds_per_player: 51 })).success,
+      db: () => insertSql("venues", venueRow({ max_active_holds_per_player: 51 })),
+    },
+    {
+      name: "negative lead time",
+      zod: () => venueCreateSchema.safeParse(v({ min_lead_minutes: -1 })).success,
+      db: () => insertSql("venues", venueRow({ min_lead_minutes: -1 })),
     },
     {
       name: "cancellation cutoff 169 hours",

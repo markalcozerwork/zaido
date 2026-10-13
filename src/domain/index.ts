@@ -12,5 +12,7 @@ export * from "./onboarding";
 export * from "./venue";
 export * from "./court";
 export * from "./booking";
+export * from "./availability";
+export * from "./realtime";
 export * from "./errors";
 export * from "./result";

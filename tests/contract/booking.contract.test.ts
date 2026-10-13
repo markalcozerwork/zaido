@@ -23,6 +23,11 @@ import {
   toZonedParts,
   addDaysToDate,
   zonedTimeToInstant,
+  GUARD_CODES,
+  LIMITS,
+  SLOT_CHANNEL_PRIVATE,
+  SLOT_EVENT,
+  slotTopic,
   type CourtSlotRules,
   type RateRulePricing,
 } from "../../src/domain";
@@ -129,6 +134,11 @@ async function slotRules(db: Db): Promise<CourtSlotRules> {
     `select day_of_week, opens_at::text, closes_at::text from public.venue_operating_hours where venue_id = $1`,
     [VENUE],
   );
+  const closures = await db.exec<{ j: { starts_at: string; ends_at: string } }>(
+    `select json_build_object('starts_at', starts_at, 'ends_at', ends_at) as j from public.court_closures
+      where venue_id = $1 and (court_id is null or court_id = $2)`,
+    [VENUE, COURT],
+  );
   return {
     timezone: venue.timezone,
     slot_increment_minutes: court.slot_increment_minutes,
@@ -137,8 +147,19 @@ async function slotRules(db: Db): Promise<CourtSlotRules> {
     court_is_active: court.is_active,
     venue_is_active: venue.is_active,
     operating_hours: hours,
+    is_open_24h: venue.is_open_24h,
     accepted_payment_methods: acceptedPaymentMethods(venue),
+    min_lead_minutes: venue.min_lead_minutes,
+    booking_horizon_days: venue.booking_horizon_days,
+    payment_window_minutes: venue.payment_window_minutes,
+    closures: closures.map((c) => c.j),
   };
+}
+
+/** The database clock for this test's transaction (what the guard calls now()). */
+async function dbNow(db: Db): Promise<Date> {
+  const [row] = await db.exec<{ now: Date }>(`select now() as now`);
+  return new Date(row!.now);
 }
 
 const quote = async (db: Db, start: Date, end: Date, coach?: string) => {
@@ -208,6 +229,7 @@ describe("checkSlotAgainstCourt ≡ the database guard (as a player, RLS on)", (
   it("accepts and rejects exactly the same candidate slots", async () => {
     const { player } = await setupVenue(db);
     const rules = await slotRules(db);
+    const now = await dbNow(db);
     await db.asUser(player);
 
     const monday = nextMonday();
@@ -234,7 +256,7 @@ describe("checkSlotAgainstCourt ≡ the database guard (as a player, RLS on)", (
             end_time: end.toISOString(),
             payment_method: "GCASH" as const,
           };
-          const predicted = checkSlotAgainstCourt(req, rules);
+          const predicted = checkSlotAgainstCourt(req, rules, now);
           const actual = await probe(
             db,
             insertSql("bookings", { court_id: COURT, booked_by: player, ...req }),
@@ -248,6 +270,139 @@ describe("checkSlotAgainstCourt ≡ the database guard (as a player, RLS on)", (
       }
     }
     expect(agreed).toBe(2 * 10 * 6);
+  });
+});
+
+describe("checkSlotAgainstCourt ≡ the guard on time rules, closures and pay-first (same code, same order)", () => {
+  it("predicts the exact first code the database raises", async () => {
+    const { owner, player } = await setupVenue(db);
+    // Open 24/7 so the outcome doesn't depend on the hour the suite runs; lead < payment window so
+    // TOO_SOON (first 30 min) and PAY_FIRST (next 60) both show.
+    await run(db, { sql: `delete from public.venue_operating_hours where venue_id = $1`, params: [VENUE] });
+    await run(
+      db,
+      updateSql(
+        "venues",
+        { min_lead_minutes: 30, payment_window_minutes: 90, booking_horizon_days: 3, is_open_24h: true },
+        { id: VENUE },
+      ),
+    );
+    const now = await dbNow(db);
+    const today = toZonedParts(now, "Asia/Manila").date;
+    await run(
+      db,
+      insertSql("court_closures", {
+        venue_id: VENUE,
+        court_id: COURT,
+        starts_at: zonedTimeToInstant(addDaysToDate(today, 1), "15:00").toISOString(),
+        ends_at: zonedTimeToInstant(addDaysToDate(today, 1), "17:00").toISOString(),
+        reason: "Resurfacing",
+        created_by: owner,
+      }),
+    );
+    const rules = await slotRules(db);
+    await db.asUser(player);
+
+    // Starts on the 30-minute grid from now through 5 hours, plus whole days around the horizon.
+    const grid = Math.ceil(now.getTime() / 1_800_000) * 1_800_000;
+    const starts = [
+      ...Array.from({ length: 10 }, (_, k) => new Date(grid + k * 1_800_000)),
+      ...[1, 2, 3, 4].flatMap((d) =>
+        ["06:00", "15:30", "16:30", "23:00"].map((t) => zonedTimeToInstant(addDaysToDate(today, d), t)),
+      ),
+    ];
+    let compared = 0;
+    const seen = new Set<string>();
+    for (const start of starts) {
+      for (const [method, ref] of [
+        ["GCASH", undefined],
+        ["GCASH", uniqueGcashRef()],
+        ["CASH_ON_COURT", undefined],
+      ] as const) {
+        const req = {
+          start_time: start.toISOString(),
+          end_time: new Date(start.getTime() + 60 * 60_000).toISOString(),
+          payment_method: method,
+          payment_ref_no: ref,
+        };
+        const predicted = checkSlotAgainstCourt(req, rules, now).map((i) => i.code)[0] ?? "OK";
+        const outcome = await probe(
+          db,
+          insertSql("bookings", { court_id: COURT, booked_by: player, ...req, payment_ref_no: ref ?? null }),
+        );
+        const actual = outcome.ok ? "OK" : mapDatabaseError(outcome).code;
+        expect(actual, `${req.start_time} ${method}${ref ? " +ref" : ""}`).toBe(predicted);
+        seen.add(actual);
+        compared++;
+      }
+    }
+    expect(compared).toBe(26 * 3);
+    // The candidates exercise every rule in this test, whatever time the suite runs.
+    expect(seen).toEqual(new Set(["OK", "TOO_SOON", "PAY_FIRST", "COURT_CLOSED", "BEYOND_HORIZON"]));
+  });
+
+  it("VENUE_HOURS_NOT_SET unless the venue is explicitly open 24/7", async () => {
+    const { player } = await setupVenue(db);
+    await run(db, { sql: `delete from public.venue_operating_hours where venue_id = $1`, params: [VENUE] });
+    const start = zonedTimeToInstant(nextMonday(), "03:00");
+    const req = {
+      start_time: start.toISOString(),
+      end_time: new Date(start.getTime() + 60 * 60_000).toISOString(),
+      payment_method: "CASH_ON_COURT" as const,
+    };
+    for (const open24h of [false, true]) {
+      await db.asAdmin();
+      await run(db, updateSql("venues", { is_open_24h: open24h }, { id: VENUE }));
+      const rules = await slotRules(db);
+      const now = await dbNow(db);
+      await db.asUser(player);
+      const predicted = checkSlotAgainstCourt(req, rules, now).map((i) => i.code)[0] ?? "OK";
+      const outcome = await probe(db, insertSql("bookings", { court_id: COURT, booked_by: player, ...req }));
+      expect(outcome.ok ? "OK" : mapDatabaseError(outcome).code).toBe(predicted);
+      expect(predicted).toBe(open24h ? "OK" : "VENUE_HOURS_NOT_SET");
+    }
+  });
+});
+
+describe("shared constants ≡ the database", () => {
+  it("hold grace", async () => {
+    const [g] = await db.exec<{ minutes: number }>(
+      `select extract(epoch from app.hold_grace())::int / 60 as minutes`,
+    );
+    expect(g!.minutes).toBe(LIMITS.booking.holdGraceMinutes);
+  });
+
+  it("the realtime topic, event and private flag used by the broadcast trigger", async () => {
+    const [f] = await db.exec<{ def: string }>(
+      `select pg_get_functiondef('app.tg_broadcast_court_slots'::regproc) as def`,
+    );
+    const [prefix, suffix] = slotTopic("\u0000").split("\u0000") as [string, string];
+    const sends = f!.def.match(/realtime\.send\([\s\S]*?\);/g) ?? [];
+    expect(sends.length).toBeGreaterThanOrEqual(2);
+    for (const call of sends) {
+      expect(call).toContain(`'${SLOT_EVENT}'`);
+      expect(call).toContain(`'${prefix}' ||`);
+      expect(call).toContain(`|| '${suffix}'`);
+      expect(call.replace(/\s+/g, " ")).toMatch(new RegExp(`, ${SLOT_CHANNEL_PRIVATE}\\)`));
+    }
+  });
+
+  it("every 'CODE: message' prefix the database raises is a code TypeScript maps", async () => {
+    const rows = await db.exec<{ src: string }>(
+      `select prosrc as src from pg_proc where pronamespace in ('app'::regnamespace, 'public'::regnamespace)`,
+    );
+    const raised = new Set<string>();
+    for (const { src } of rows) {
+      for (const m of src.matchAll(/message\s*=\s*(?:format\(\s*)?'([A-Z][A-Z_]+):\s/g)) raised.add(m[1]!);
+    }
+    const mapped = new Set<string>([
+      ...Object.keys(GUARD_CODES),
+      "COACH_UNAVAILABLE",
+      "SLOT_ALREADY_YOURS",
+      "EVENT_FULL",
+    ]);
+    expect([...raised].filter((c) => !mapped.has(c))).toEqual([]);
+    expect(Object.keys(GUARD_CODES).filter((c) => !raised.has(c))).toEqual([]);
   });
 });
 

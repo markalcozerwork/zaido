@@ -12,9 +12,10 @@
  */
 import { z } from "zod";
 import type { InsertRow, Row, RpcArgs, RpcReturns, UpdateRow } from "../db";
-import { PAYMENT_METHOD_LABELS, paymentMethodSchema, type PaymentMethod } from "./enums";
+import { paymentMethodSchema, type PaymentMethod } from "./enums";
+import { GUARD_CODES, type DomainError, type GuardCode } from "./errors";
 import { LIMITS } from "./limits";
-import { formatPeso } from "./money";
+import { formatPeso, pesoAmountSchema } from "./money";
 import { compact } from "./object";
 import {
   instantSchema,
@@ -23,10 +24,11 @@ import {
   minutesSinceMidnight,
   optionalLine,
   optionalParagraphs,
+  phPhoneSchema,
   storagePathSchema,
   uuidSchema,
 } from "./primitives";
-import { addMinutes, isOnMinuteGrid, minutesBetween, toZonedParts } from "./time";
+import { addDaysToDate, addMinutes, isOnMinuteGrid, minutesBetween, toZonedParts } from "./time";
 
 // -----------------------------------------------------------------------------
 // Payment reference numbers
@@ -81,54 +83,140 @@ const bookingRequestFields = {
   notes: optionalParagraphs(500),
 };
 
-export function createBookingRequestSchema({ now = () => new Date() }: BookingRequestOptions = {}) {
-  return z.strictObject(bookingRequestFields).superRefine((b, ctx) => {
-    // Malformed instants are already reported by the field schema.
-    if (!isValidInstant(b.start_time) || !isValidInstant(b.end_time)) return;
-    const start = new Date(b.start_time);
-    const end = new Date(b.end_time);
-    const grid = LIMITS.booking.gridMinutes;
+type RequestShape = {
+  start_time: string;
+  end_time: string;
+  payment_method: PaymentMethod;
+  payment_ref_no?: string | undefined;
+};
 
-    if (end <= start) {
-      ctx.addIssue({ code: "custom", path: ["end_time"], message: "End time must be after start time." });
-    } else {
-      if (!isOnMinuteGrid(start, grid) || !isOnMinuteGrid(end, grid)) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["start_time"],
-          message: "Bookings start and end on 15-minute marks.",
-        });
-      }
-      if (minutesBetween(start, end) > LIMITS.booking.maxDurationMinutes) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["end_time"],
-          message: "A single booking can be at most 12 hours.",
-        });
-      }
-    }
+/** Shape rules every booking request shares: order, 15-minute grid, 12-hour cap, reference format. */
+function checkRequestShape(b: RequestShape, ctx: z.RefinementCtx): boolean {
+  // Malformed instants are already reported by the field schema.
+  if (!isValidInstant(b.start_time) || !isValidInstant(b.end_time)) return false;
+  const start = new Date(b.start_time);
+  const end = new Date(b.end_time);
+  const grid = LIMITS.booking.gridMinutes;
 
-    const t = now();
-    if (start < t) {
-      ctx.addIssue({ code: "custom", path: ["start_time"], message: "That time has already passed." });
-    } else if (start > addMinutes(t, LIMITS.booking.maxAdvanceDays * 24 * 60)) {
+  if (end <= start) {
+    ctx.addIssue({ code: "custom", path: ["end_time"], message: "End time must be after start time." });
+  } else {
+    if (!isOnMinuteGrid(start, grid) || !isOnMinuteGrid(end, grid)) {
       ctx.addIssue({
         code: "custom",
         path: ["start_time"],
-        message: `Bookings open up to ${LIMITS.booking.maxAdvanceDays} days ahead.`,
+        message: "Bookings start and end on 15-minute marks.",
       });
     }
-
-    if (b.payment_ref_no !== undefined) {
-      const problem = paymentRefIssue(b.payment_method, b.payment_ref_no);
-      if (problem) ctx.addIssue({ code: "custom", path: ["payment_ref_no"], message: problem });
+    if (minutesBetween(start, end) > LIMITS.booking.maxDurationMinutes) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["end_time"],
+        message: "A single booking can be at most 12 hours.",
+      });
     }
+  }
+
+  if (b.payment_ref_no !== undefined) {
+    const problem = paymentRefIssue(b.payment_method, b.payment_ref_no);
+    if (problem) ctx.addIssue({ code: "custom", path: ["payment_ref_no"], message: problem });
+  }
+  return true;
+}
+
+/**
+ * Platform-wide time sanity for player requests. Venue rules (lead time, the
+ * day-based horizon in venue time, hours, closures) are checked against the
+ * court with `checkSlotAgainstCourt`, so this ceiling sits one day beyond the
+ * longest horizon a venue can set and never rejects what the venue accepts.
+ */
+function checkRequestTime(b: RequestShape, now: Date, ctx: z.RefinementCtx) {
+  const start = new Date(b.start_time);
+  if (start < now) {
+    ctx.addIssue({ code: "custom", path: ["start_time"], message: "That time has already passed." });
+  } else if (start > addMinutes(now, (LIMITS.booking.maxAdvanceDays + 1) * 24 * 60)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["start_time"],
+      message: `Bookings open up to ${LIMITS.booking.maxAdvanceDays} days ahead.`,
+    });
+  }
+}
+
+export function createBookingRequestSchema({ now = () => new Date() }: BookingRequestOptions = {}) {
+  return z.strictObject(bookingRequestFields).superRefine((b, ctx) => {
+    if (checkRequestShape(b, ctx)) checkRequestTime(b, now(), ctx);
   });
 }
 
 export const bookingRequestSchema = createBookingRequestSchema();
 export type BookingRequestInput = z.input<typeof bookingRequestSchema>;
 export type BookingRequest = z.output<typeof bookingRequestSchema>;
+
+/**
+ * What the create-booking server action accepts: the request plus the
+ * checkout's idempotency key. The client generates the key once per checkout
+ * (crypto.randomUUID()) and reuses it on every retry and double-tap, so a
+ * lost response can never create a second booking.
+ */
+export function createBookingActionSchema({ now = () => new Date() }: BookingRequestOptions = {}) {
+  return z.strictObject({ ...bookingRequestFields, idempotency_key: uuidSchema }).superRefine((b, ctx) => {
+    if (checkRequestShape(b, ctx)) checkRequestTime(b, now(), ctx);
+  });
+}
+
+export const bookingActionSchema = createBookingActionSchema();
+export type BookingActionInput = z.input<typeof bookingActionSchema>;
+export type BookingAction = z.output<typeof bookingActionSchema>;
+
+/**
+ * Front-desk bookings (venue staff). The database decides who counts as staff
+ * and skips the player-only slot rules for them (past, lead time, horizon,
+ * hours, closures), so only shape is checked here.
+ *   * `booked_by`: book in a registered player's name (verified venues only,
+ *     never with a coach).
+ *   * `walk_in_name` / `walk_in_phone`: a player without an account; the
+ *     booking stays in the staff member's name.
+ *   * `discount_amount`: off the court and lights amount, never the coach fee.
+ *   * `mark_paid`: payment collected at the desk now (confirms the booking).
+ */
+export const staffBookingSchema = z
+  .strictObject({
+    ...bookingRequestFields,
+    idempotency_key: uuidSchema,
+    booked_by: uuidSchema.optional(),
+    walk_in_name: optionalLine(LIMITS.booking.walkInName.min, LIMITS.booking.walkInName.max),
+    walk_in_phone: phPhoneSchema.optional(),
+    discount_amount: pesoAmountSchema().optional(),
+    mark_paid: z.boolean().optional(),
+  })
+  .superRefine((b, ctx) => {
+    checkRequestShape(b, ctx);
+    if (b.walk_in_phone !== undefined && b.walk_in_name === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["walk_in_name"],
+        message: "Add the walk-in player's name with their number.",
+      });
+    }
+    if (b.booked_by !== undefined && (b.walk_in_name !== undefined || b.walk_in_phone !== undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["walk_in_name"],
+        message: "Book either for a registered player or for a walk-in, not both.",
+      });
+    }
+    if (b.booked_by !== undefined && b.coach_id !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["coach_id"],
+        message: "Coach sessions can only be booked by the player.",
+      });
+    }
+  });
+
+export type StaffBookingInput = z.input<typeof staffBookingSchema>;
+export type StaffBooking = z.output<typeof staffBookingSchema>;
 
 /** Columns the database owns on insert (price, state, stamps, identity). */
 type ServerOwnedBookingColumns =
@@ -227,7 +315,16 @@ export const busySlotsQuerySchema = z
     },
   );
 
+/**
+ * One busy range on a court. `kind`: BOOKED (confirmed or payment under
+ * review), HOLD (unpaid; frees itself at `held_until` unless paid; null =
+ * held until the venue decides, e.g. unconfirmed cash) or CLOSED (a court
+ * closure, with its `reason`). `is_mine` / `booking_id` only for the caller's
+ * own player bookings.
+ */
 export type BusySlot = RpcReturns<"get_court_busy_slots">[number];
+export type VenueBusySlot = RpcReturns<"get_venue_busy_slots">[number];
+export type BusyKind = "BOOKED" | "HOLD" | "CLOSED";
 
 export function toBusySlotsArgs(q: z.output<typeof busySlotsQuerySchema>): RpcArgs<"get_court_busy_slots"> {
   return { p_court_id: q.court_id, p_from: q.from, p_to: q.to };
@@ -243,22 +340,46 @@ export interface CourtSlotRules {
   max_booking_minutes: number;
   court_is_active: boolean;
   venue_is_active: boolean;
-  /** Empty = open 24/7, as in the database. */
+  /** Venue-local weekly windows. Empty = no published hours (see `is_open_24h`). */
   operating_hours: ReadonlyArray<{ day_of_week: number; opens_at: string; closes_at: string }>;
+  /** Without hours, players can book only when the venue is explicitly open 24/7. */
+  is_open_24h: boolean;
   accepted_payment_methods: readonly PaymentMethod[];
+  min_lead_minutes: number;
+  /** Calendar days ahead in venue time: a whole day opens at local midnight. */
+  booking_horizon_days: number;
+  payment_window_minutes: number;
+  /** Closures affecting this court (venue-wide ones included). */
+  closures: ReadonlyArray<{ starts_at: string; ends_at: string }>;
 }
 
-export type SlotIssueCode =
-  | "COURT_UNAVAILABLE"
-  | "OFF_INCREMENT"
-  | "TOO_SHORT"
-  | "TOO_LONG"
-  | "VENUE_CLOSED"
-  | "PAYMENT_METHOD_UNAVAILABLE";
+/** The guard codes `checkSlotAgainstCourt` can predict, in the order the guard raises them. */
+export const SLOT_ISSUE_CODES = [
+  "COURT_INACTIVE",
+  "SLOT_IN_PAST",
+  "TOO_SOON",
+  "BEYOND_HORIZON",
+  "OFF_INCREMENT",
+  "DURATION_OUT_OF_RANGE",
+  "VENUE_CLOSED",
+  "VENUE_HOURS_NOT_SET",
+  "COURT_CLOSED",
+  "PAYMENT_METHOD_UNAVAILABLE",
+  "PAY_FIRST",
+] as const satisfies readonly GuardCode[];
+
+export type SlotIssueCode = (typeof SLOT_ISSUE_CODES)[number];
 
 export interface SlotIssue {
   code: SlotIssueCode;
+  /** Same text the database raises (after the "CODE: " prefix). */
   message: string;
+}
+
+/** A slot issue as the DomainError the database would have produced. */
+export function slotIssueToError(issue: SlotIssue): DomainError {
+  const field = GUARD_CODES[issue.code];
+  return { code: issue.code, message: issue.message, retryable: false, ...(field ? { field } : {}) };
 }
 
 /** Payment methods a venue row has set up (same rule as the guard). */
@@ -276,7 +397,11 @@ export function acceptedPaymentMethods(
   return methods;
 }
 
-/** Same algorithm as app.is_within_operating_hours: every 15-minute slice must sit inside a window. */
+/**
+ * Same algorithm as app.is_within_operating_hours: every 15-minute slice must
+ * sit inside a window. No windows → true (whether that means "open" is the
+ * caller's call: see `is_open_24h`).
+ */
 export function isWithinOperatingHours(
   start: Date,
   end: Date,
@@ -297,9 +422,36 @@ export function isWithinOperatingHours(
   return true;
 }
 
+/** Day-based horizon, like the guard: the venue-local start date vs today + N days. */
+export function isBeyondHorizon(start: Date, now: Date, timeZone: string, horizonDays: number): boolean {
+  return toZonedParts(start, timeZone).date > addDaysToDate(toZonedParts(now, timeZone).date, horizonDays);
+}
+
+/** Half-open [a1, a2) ∩ [b1, b2) ≠ ∅ (Postgres `&&` on '[)' ranges). */
+export const rangesOverlap = (a1: Date, a2: Date, b1: Date, b2: Date): boolean => a1 < b2 && b1 < a2;
+
+export function isCourtClosed(start: Date, end: Date, rules: Pick<CourtSlotRules, "closures">): boolean {
+  return rules.closures.some((c) => rangesOverlap(start, end, new Date(c.starts_at), new Date(c.ends_at)));
+}
+
+const PAYMENT_METHOD_UNAVAILABLE_TEXT: Record<PaymentMethod, string> = {
+  CASH_ON_COURT: "This venue does not accept cash on court.",
+  GCASH: "This venue has not set up GCash payments.",
+  MAYA: "This venue has not set up Maya payments.",
+  BANK_TRANSFER: "This venue has not set up bank transfers.",
+};
+
+/**
+ * Mirror of the guard's player rules for a new booking, in the guard's order
+ * (the first issue is what the database would raise). The database still
+ * decides; this gives instant feedback and saves a round trip.
+ */
 export function checkSlotAgainstCourt(
-  req: Pick<BookingRequest, "start_time" | "end_time" | "payment_method">,
+  req: Pick<BookingRequest, "start_time" | "end_time" | "payment_method"> & {
+    payment_ref_no?: string | undefined;
+  },
   rules: CourtSlotRules,
+  now: Date = new Date(),
 ): SlotIssue[] {
   const issues: SlotIssue[] = [];
   const start = new Date(req.start_time);
@@ -308,27 +460,73 @@ export function checkSlotAgainstCourt(
   const inc = rules.slot_increment_minutes;
 
   if (!rules.court_is_active || !rules.venue_is_active) {
-    issues.push({ code: "COURT_UNAVAILABLE", message: "This court is not accepting bookings." });
+    issues.push({ code: "COURT_INACTIVE", message: "This court is not accepting bookings." });
+  }
+  if (start < now) {
+    issues.push({ code: "SLOT_IN_PAST", message: "That time has already started. Pick another slot." });
+  }
+  if (start < addMinutes(now, rules.min_lead_minutes)) {
+    issues.push({
+      code: "TOO_SOON",
+      message: `This venue takes bookings at least ${rules.min_lead_minutes} minutes ahead.`,
+    });
+  }
+  if (isBeyondHorizon(start, now, rules.timezone, rules.booking_horizon_days)) {
+    issues.push({
+      code: "BEYOND_HORIZON",
+      message: `This venue takes bookings up to ${rules.booking_horizon_days} days ahead.`,
+    });
   }
   if (toZonedParts(start, rules.timezone).minuteOfDay % inc !== 0 || minutes % inc !== 0) {
     issues.push({ code: "OFF_INCREMENT", message: `This court books in ${inc}-minute increments.` });
   }
-  if (minutes < rules.min_booking_minutes) {
-    issues.push({ code: "TOO_SHORT", message: `Book at least ${rules.min_booking_minutes} minutes.` });
+  if (minutes < rules.min_booking_minutes || minutes > rules.max_booking_minutes) {
+    issues.push({
+      code: "DURATION_OUT_OF_RANGE",
+      message: `Booking length must be between ${rules.min_booking_minutes} and ${rules.max_booking_minutes} minutes.`,
+    });
   }
-  if (minutes > rules.max_booking_minutes) {
-    issues.push({ code: "TOO_LONG", message: `Book at most ${rules.max_booking_minutes} minutes.` });
+  if (rules.operating_hours.length > 0) {
+    if (!isWithinOperatingHours(start, end, rules)) {
+      issues.push({ code: "VENUE_CLOSED", message: "The venue is closed during part of the selected time." });
+    }
+  } else if (!rules.is_open_24h) {
+    issues.push({
+      code: "VENUE_HOURS_NOT_SET",
+      message: "This venue hasn't published its opening hours yet.",
+    });
   }
-  if (!isWithinOperatingHours(start, end, rules)) {
-    issues.push({ code: "VENUE_CLOSED", message: "The venue is closed during part of the selected time." });
+  if (isCourtClosed(start, end, rules)) {
+    issues.push({ code: "COURT_CLOSED", message: "The court is closed during part of the selected time." });
   }
   if (!rules.accepted_payment_methods.includes(req.payment_method)) {
     issues.push({
       code: "PAYMENT_METHOD_UNAVAILABLE",
-      message: `This venue doesn't accept ${PAYMENT_METHOD_LABELS[req.payment_method]}.`,
+      message: PAYMENT_METHOD_UNAVAILABLE_TEXT[req.payment_method],
+    });
+  }
+  if (needsPaymentFirst(start, req.payment_method, req.payment_ref_no, rules.payment_window_minutes, now)) {
+    issues.push({
+      code: "PAY_FIRST",
+      message: `This slot starts within ${rules.payment_window_minutes} minutes. Send the payment first, then book with your reference number.`,
     });
   }
   return issues;
+}
+
+/**
+ * An unpaid e-wallet hold that would only expire after the session starts
+ * would let the court be resold mid-game, so such slots need the reference
+ * number up front.
+ */
+export function needsPaymentFirst(
+  start: Date,
+  method: PaymentMethod,
+  paymentRefNo: string | undefined,
+  paymentWindowMinutes: number,
+  now: Date,
+): boolean {
+  return method !== "CASH_ON_COURT" && !paymentRefNo && start < addMinutes(now, paymentWindowMinutes);
 }
 
 // -----------------------------------------------------------------------------
@@ -336,6 +534,24 @@ export function checkSlotAgainstCourt(
 // -----------------------------------------------------------------------------
 export const RECEIPT_EXTENSIONS = ["jpg", "jpeg", "png", "webp", "heic", "pdf"] as const;
 
+function receiptPathIssue(bookingId: string, path: string): boolean {
+  const [folder, file, ...rest] = path.split("/");
+  const ext = file?.split(".").pop()?.toLowerCase() ?? "";
+  return (
+    folder !== bookingId ||
+    !file ||
+    rest.length > 0 ||
+    !(RECEIPT_EXTENSIONS as readonly string[]).includes(ext)
+  );
+}
+
+const RECEIPT_MESSAGE = "Upload the receipt as a photo or PDF for this booking.";
+
+/**
+ * Reference first, receipt optional: on a weak signal the 13-digit reference
+ * gets through even when the screenshot upload doesn't. The receipt can be
+ * attached later (`receiptAttachSchema`) while the payment is under review.
+ */
 export const paymentSubmissionSchema = z
   .strictObject({
     booking_id: uuidSchema,
@@ -343,36 +559,39 @@ export const paymentSubmissionSchema = z
     payment_method: z.enum(["GCASH", "MAYA", "BANK_TRANSFER"]),
     payment_ref_no: paymentRefSchema,
     /** Object path in the private `payment-receipts` bucket: "<booking_id>/<file>". */
-    receipt_path: storagePathSchema,
+    receipt_path: storagePathSchema.optional(),
   })
   .superRefine((p, ctx) => {
     const problem = paymentRefIssue(p.payment_method, p.payment_ref_no);
     if (problem) ctx.addIssue({ code: "custom", path: ["payment_ref_no"], message: problem });
-
-    const [folder, file, ...rest] = p.receipt_path.split("/");
-    const ext = file?.split(".").pop()?.toLowerCase() ?? "";
-    if (
-      folder !== p.booking_id ||
-      !file ||
-      rest.length > 0 ||
-      !(RECEIPT_EXTENSIONS as readonly string[]).includes(ext)
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["receipt_path"],
-        message: "Upload the receipt as a photo or PDF for this booking.",
-      });
+    if (p.receipt_path !== undefined && receiptPathIssue(p.booking_id, p.receipt_path)) {
+      ctx.addIssue({ code: "custom", path: ["receipt_path"], message: RECEIPT_MESSAGE });
     }
   });
 
 export type PaymentSubmission = z.output<typeof paymentSubmissionSchema>;
 
 export function toPaymentSubmissionUpdate(p: PaymentSubmission): UpdateRow<"bookings"> {
-  return {
+  return compact({
     payment_ref_no: p.payment_ref_no,
     payment_receipt_url: p.receipt_path,
-    payment_status: "AWAITING_VERIFICATION",
-  };
+    payment_status: "AWAITING_VERIFICATION" as const,
+  });
+}
+
+export const receiptAttachSchema = z
+  .strictObject({ booking_id: uuidSchema, receipt_path: storagePathSchema })
+  .superRefine((p, ctx) => {
+    if (receiptPathIssue(p.booking_id, p.receipt_path)) {
+      ctx.addIssue({ code: "custom", path: ["receipt_path"], message: RECEIPT_MESSAGE });
+    }
+  });
+
+export type ReceiptAttach = z.output<typeof receiptAttachSchema>;
+
+/** Attaching keeps the payment under review (the guard allows receipts only then). */
+export function toReceiptAttachUpdate(p: ReceiptAttach): UpdateRow<"bookings"> {
+  return { payment_receipt_url: p.receipt_path, payment_status: "AWAITING_VERIFICATION" };
 }
 
 export const paymentReviewSchema = z.discriminatedUnion("decision", [
@@ -476,7 +695,8 @@ export function describeBooking(b: BookingStateFields, now: Date = new Date()): 
           nextAction: "WAIT_FOR_VERIFICATION",
         };
       }
-      if (b.payment_due_at && new Date(b.payment_due_at) <= now) {
+      // The slot is held until the due time plus a short grace (app.hold_grace()).
+      if (b.payment_due_at && holdEndsAt(b.payment_due_at) <= now) {
         return { label: "Payment window closed", tone: "danger", nextAction: "NONE" };
       }
       if (b.payment_status === "REJECTED") {
@@ -498,13 +718,129 @@ export function describeBooking(b: BookingStateFields, now: Date = new Date()): 
   }
 }
 
-/** Mirrors the guard: pending → always; confirmed → only before the venue's cutoff. */
+/** When an unpaid hold really lets go of the slot: payment_due_at + app.hold_grace(). */
+export function holdEndsAt(paymentDueAt: string | Date): Date {
+  return addMinutes(new Date(paymentDueAt), LIMITS.booking.holdGraceMinutes);
+}
+
+type CancellableFields = Pick<Row<"bookings">, "booking_status" | "payment_status" | "start_time">;
+
+export interface CancellationTerms {
+  allowed: boolean;
+  /** Money was sent (verified or not), so the venue owes a refund if the player cancels. */
+  refundEligible: boolean;
+  /** Last moment a player may cancel, when a cutoff applies (confirmed, or payment sent). */
+  cutoffAt: string | null;
+}
+
+/**
+ * Mirror of the guard's player-cancel rules:
+ *   * never once the session has started;
+ *   * a confirmed booking, or one whose payment was sent (under review), only
+ *     up to the venue's cutoff before start;
+ *   * an unpaid hold any time before start.
+ */
+export function cancellationTerms(
+  b: CancellableFields,
+  cancellationCutoffHours: number,
+  now: Date = new Date(),
+): CancellationTerms {
+  const start = new Date(b.start_time);
+  const live = b.booking_status === "PENDING_PAYMENT" || b.booking_status === "CONFIRMED";
+  const moneySent = b.payment_status === "PAID" || b.payment_status === "AWAITING_VERIFICATION";
+  const cutoffApplies = b.booking_status === "CONFIRMED" || b.payment_status === "AWAITING_VERIFICATION";
+  const cutoff = addMinutes(start, -cancellationCutoffHours * 60);
+  const allowed = live && now < start && (!cutoffApplies || now <= cutoff);
+  return {
+    allowed,
+    refundEligible: allowed && moneySent,
+    cutoffAt: cutoffApplies ? cutoff.toISOString() : null,
+  };
+}
+
 export function canPlayerCancel(
-  b: Pick<Row<"bookings">, "booking_status" | "start_time">,
+  b: CancellableFields,
   cancellationCutoffHours: number,
   now: Date = new Date(),
 ): boolean {
-  if (b.booking_status === "PENDING_PAYMENT") return true;
-  if (b.booking_status !== "CONFIRMED") return false;
-  return now <= addMinutes(new Date(b.start_time), -cancellationCutoffHours * 60);
+  return cancellationTerms(b, cancellationCutoffHours, now).allowed;
+}
+
+// -----------------------------------------------------------------------------
+// Venue staff: reschedules and court closures
+// -----------------------------------------------------------------------------
+/** Move a booking (venue staff only; the database checks the overlap and who may move it). */
+export const bookingRescheduleSchema = z
+  .strictObject({
+    booking_id: uuidSchema,
+    /** Omit to stay on the same court. Moves stay within the venue. */
+    court_id: uuidSchema.optional(),
+    start_time: instantSchema,
+    end_time: instantSchema,
+  })
+  .superRefine((b, ctx) => {
+    if (!isValidInstant(b.start_time) || !isValidInstant(b.end_time)) return;
+    const start = new Date(b.start_time);
+    const end = new Date(b.end_time);
+    if (end <= start) {
+      ctx.addIssue({ code: "custom", path: ["end_time"], message: "End time must be after start time." });
+    } else if (
+      !isOnMinuteGrid(start, LIMITS.booking.gridMinutes) ||
+      !isOnMinuteGrid(end, LIMITS.booking.gridMinutes)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["start_time"],
+        message: "Bookings start and end on 15-minute marks.",
+      });
+    } else if (minutesBetween(start, end) > LIMITS.booking.maxDurationMinutes) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["end_time"],
+        message: "A single booking can be at most 12 hours.",
+      });
+    }
+  });
+
+export type BookingReschedule = z.output<typeof bookingRescheduleSchema>;
+
+export function toRescheduleUpdate(r: BookingReschedule): UpdateRow<"bookings"> {
+  return compact({ court_id: r.court_id, start_time: r.start_time, end_time: r.end_time });
+}
+
+/** Typhoon signals, maintenance, barangay events. `court_id` omitted = every court at the venue. */
+export const courtClosureSchema = z
+  .strictObject({
+    venue_id: uuidSchema,
+    court_id: uuidSchema.optional(),
+    starts_at: instantSchema,
+    ends_at: instantSchema,
+    reason: line(LIMITS.closure.reason.min, LIMITS.closure.reason.max),
+  })
+  .superRefine((c, ctx) => {
+    if (!isValidInstant(c.starts_at) || !isValidInstant(c.ends_at)) return;
+    const start = new Date(c.starts_at);
+    const end = new Date(c.ends_at);
+    if (end <= start) {
+      ctx.addIssue({ code: "custom", path: ["ends_at"], message: "A closure must end after it starts." });
+    } else if (minutesBetween(start, end) > LIMITS.closure.maxDays * 24 * 60) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ends_at"],
+        message: `A closure can last at most ${LIMITS.closure.maxDays} days. Add another one for longer.`,
+      });
+    }
+  });
+
+export type CourtClosure = z.output<typeof courtClosureSchema>;
+
+/** created_by is stamped by the database. */
+export function toClosureInsert(c: CourtClosure): InsertRow<"court_closures"> {
+  return compact({
+    venue_id: c.venue_id,
+    court_id: c.court_id,
+    starts_at: c.starts_at,
+    ends_at: c.ends_at,
+    reason: c.reason,
+  });
 }

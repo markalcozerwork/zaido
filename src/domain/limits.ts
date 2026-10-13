@@ -15,6 +15,9 @@ export const LIMITS = {
     photos: { max: 20 },
     paymentWindowMinutes: { min: 5, max: 1_440 },
     cancellationCutoffHours: { min: 0, max: 168 },
+    minLeadMinutes: { min: 0, max: 1_440 },
+    bookingHorizonDays: { min: 1, max: 90 },
+    maxActiveHoldsPerPlayer: { min: 1, max: 50 },
   },
   court: {
     name: { min: 1, max: 60 },
@@ -28,7 +31,11 @@ export const LIMITS = {
     maxDurationMinutes: 12 * 60,
     maxAdvanceDays: 90,
     playerCount: { min: 1, max: 64 },
+    /** app.hold_grace(): how long after payment_due_at an unpaid hold still holds the slot. */
+    holdGraceMinutes: 5,
+    walkInName: { min: 2, max: 120 },
   },
+  closure: { reason: { min: 3, max: 200 }, maxDays: 31 },
   paymentRef: { pattern: /^[A-Za-z0-9-]{6,40}$/ },
 } as const;
 
@@ -53,6 +60,10 @@ export const DB_DEFAULTS = {
     auto_confirm_cash_bookings: true,
     payment_window_minutes: 30,
     cancellation_cutoff_hours: 24,
+    max_active_holds_per_player: 3,
+    min_lead_minutes: 0,
+    booking_horizon_days: 90,
+    is_open_24h: false,
   },
   court: {
     slot_increment_minutes: 30,

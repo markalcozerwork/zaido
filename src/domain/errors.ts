@@ -20,7 +20,9 @@ export type DomainErrorCode =
   | "FORBIDDEN"
   | "UNAUTHENTICATED"
   | "NOT_FOUND"
+  | "BOOKING_CANCELLED"
   | "RETRYABLE"
+  | "ABORTED"
   | "UNKNOWN"
   // Business rules raised by the database as "CODE: message" (see GUARD_CODES).
   | GuardCode;
@@ -74,6 +76,8 @@ export interface DomainError {
 
 /** The shape of PostgrestError (supabase-js) and node-postgres DatabaseError. */
 export interface DatabaseErrorLike {
+  /** HTTP status of the PostgREST response; 0 when the request never got one (network, abort). */
+  status?: number | undefined;
   code?: string | undefined;
   message?: string | undefined;
   details?: string | null | undefined;
@@ -92,6 +96,65 @@ const CONSTRAINTS: Record<string, Omit<DomainError, "retryable" | "cause">> = {
     code: "COACH_UNAVAILABLE",
     message: "That coach is already booked at this time.",
     field: "coach_id",
+  },
+  coach_commitments_no_overlap: {
+    code: "COACH_UNAVAILABLE",
+    message: "That coach is already booked at this time.",
+    field: "coach_id",
+  },
+  bookings_reserved_for_event_key: {
+    code: "COURT_BOOKING_UNAVAILABLE",
+    message: "That court booking is already used by another event.",
+    field: "booking_id",
+  },
+  bookings_idempotency_key: {
+    code: "CONFLICT",
+    message: "This checkout is still being processed. Please wait a moment and refresh.",
+  },
+  bookings_walk_in_name_length: {
+    code: "VALIDATION_FAILED",
+    message: "Enter the walk-in player's name (2–120 characters).",
+    field: "walk_in_name",
+  },
+  bookings_walk_in_phone_format: {
+    code: "VALIDATION_FAILED",
+    message: "Enter a Philippine number, e.g. 0917 123 4567.",
+    field: "walk_in_phone",
+  },
+  bookings_walk_in_phone_needs_name: {
+    code: "VALIDATION_FAILED",
+    message: "Add the walk-in player's name with their number.",
+    field: "walk_in_name",
+  },
+  venues_max_active_holds: {
+    code: "VALIDATION_FAILED",
+    message: "Allow between 1 and 50 unpaid bookings per player.",
+    field: "max_active_holds_per_player",
+  },
+  venues_min_lead_minutes: {
+    code: "VALIDATION_FAILED",
+    message: "The minimum lead time must be between 0 and 1,440 minutes.",
+    field: "min_lead_minutes",
+  },
+  venues_booking_horizon: {
+    code: "VALIDATION_FAILED",
+    message: "Bookings can open between 1 and 90 days ahead.",
+    field: "booking_horizon_days",
+  },
+  court_closures_order: {
+    code: "VALIDATION_FAILED",
+    message: "A closure must end after it starts.",
+    field: "ends_at",
+  },
+  court_closures_max_length: {
+    code: "VALIDATION_FAILED",
+    message: "A closure can last at most 31 days. Add another one for longer.",
+    field: "ends_at",
+  },
+  court_closures_reason_length: {
+    code: "VALIDATION_FAILED",
+    message: "Give a reason (3–200 characters).",
+    field: "reason",
   },
   bookings_payment_ref_unique: {
     code: "PAYMENT_REF_ALREADY_USED",
@@ -236,6 +299,21 @@ export function mapDatabaseError(err: DatabaseErrorLike): DomainError {
     default:
       return { ...base, code: "UNKNOWN", message: "Something went wrong. Please try again." };
   }
+}
+
+/**
+ * Failures where sending the SAME request again may succeed: the request never
+ * got a response (network, timeout: status 0), the gateway or PostgREST's pool
+ * was momentarily unavailable, or Postgres rolled the transaction back
+ * (serialization failure, deadlock). Only safe for idempotent requests, which
+ * every booking action is (create_booking via its idempotency key; updates set
+ * absolute values).
+ */
+export function isTransientError(err: DatabaseErrorLike): boolean {
+  if (err.status === 0) return true;
+  if (err.status === undefined && err.code === "") return true;
+  if (err.status !== undefined && [502, 503, 504, 520].includes(err.status)) return true;
+  return ["PGRST000", "PGRST001", "PGRST002", "PGRST003", "40001", "40P01"].includes(err.code ?? "");
 }
 
 export function isDomainError(value: unknown): value is DomainError {

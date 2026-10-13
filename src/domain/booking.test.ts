@@ -4,7 +4,12 @@ import {
   bookingCancellationSchema,
   busySlotsQuerySchema,
   canPlayerCancel,
+  cancellationTerms,
   checkSlotAgainstCourt,
+  holdEndsAt,
+  receiptAttachSchema,
+  slotIssueToError,
+  staffBookingSchema,
   createBookingRequestSchema,
   describeBooking,
   paymentReviewSchema,
@@ -115,20 +120,30 @@ describe("checkSlotAgainstCourt (mirror of the DB guard)", () => {
       opens_at: "06:00:00",
       closes_at: "24:00:00",
     })),
+    is_open_24h: false,
     accepted_payment_methods: ["GCASH", "CASH_ON_COURT"],
+    min_lead_minutes: 0,
+    booking_horizon_days: 90,
+    payment_window_minutes: 30,
+    closures: [],
   };
   const codes = (
     times: { start_time: string; end_time: string },
     method: "GCASH" | "MAYA" = "GCASH",
     r = rules,
-  ) => checkSlotAgainstCourt({ ...times, payment_method: method }, r).map((i) => i.code);
+    now = NOW,
+    ref?: string,
+  ) =>
+    checkSlotAgainstCourt({ ...times, payment_method: method, payment_ref_no: ref }, r, now).map(
+      (i) => i.code,
+    );
 
   it.each([
     ["valid", slot("2026-10-19", "18:00", "19:00"), []],
     ["ends exactly at 24:00 closing", slot("2026-10-19", "23:00", "24:00"), []],
     ["off increment", slot("2026-10-19", "18:15", "19:15"), ["OFF_INCREMENT"]],
-    ["too short", slot("2026-10-19", "18:00", "18:30"), ["TOO_SHORT"]],
-    ["too long", slot("2026-10-19", "10:00", "14:30"), ["TOO_LONG"]],
+    ["too short", slot("2026-10-19", "18:00", "18:30"), ["DURATION_OUT_OF_RANGE"]],
+    ["too long", slot("2026-10-19", "10:00", "14:30"), ["DURATION_OUT_OF_RANGE"]],
     ["before opening", slot("2026-10-19", "05:00", "06:00"), ["VENUE_CLOSED"]],
     [
       "crosses midnight into closed hours",
@@ -146,13 +161,70 @@ describe("checkSlotAgainstCourt (mirror of the DB guard)", () => {
     expect(codes(slot("2026-10-19", "18:00", "19:00"), "MAYA")).toEqual(["PAYMENT_METHOD_UNAVAILABLE"]);
     expect(
       codes(slot("2026-10-19", "18:00", "19:00"), "GCASH", { ...rules, court_is_active: false }),
-    ).toEqual(["COURT_UNAVAILABLE"]);
+    ).toEqual(["COURT_INACTIVE"]);
   });
 
-  it("treats a venue with no hours as open 24/7", () => {
-    expect(codes(slot("2026-10-19", "03:00", "04:00"), "GCASH", { ...rules, operating_hours: [] })).toEqual(
+  it("without published hours, only an explicit 24/7 venue takes bookings", () => {
+    const noHours = { ...rules, operating_hours: [] };
+    expect(codes(slot("2026-10-19", "03:00", "04:00"), "GCASH", noHours)).toEqual(["VENUE_HOURS_NOT_SET"]);
+    expect(codes(slot("2026-10-19", "03:00", "04:00"), "GCASH", { ...noHours, is_open_24h: true })).toEqual(
       [],
     );
+  });
+
+  it("applies time rules relative to the server clock, in the guard's order", () => {
+    // NOW = Tue 2026-10-13 08:00 Manila.
+    expect(codes(slot("2026-10-13", "07:00", "08:00"))[0]).toBe("SLOT_IN_PAST");
+    expect(codes(slot("2026-10-13", "09:00", "10:00"), "GCASH", { ...rules, min_lead_minutes: 120 })).toEqual(
+      ["TOO_SOON"],
+    );
+    // Day-based horizon in venue time: 2 days ahead means through Thursday, any hour.
+    const twoDays = { ...rules, booking_horizon_days: 2 };
+    expect(codes(slot("2026-10-15", "22:00", "23:00"), "GCASH", twoDays)).toEqual([]);
+    expect(codes(slot("2026-10-16", "06:00", "07:00"), "GCASH", twoDays)).toEqual(["BEYOND_HORIZON"]);
+  });
+
+  it("PAY_FIRST: e-wallet slots starting inside the payment window need the reference up front", () => {
+    const soon = slot("2026-10-13", "08:30", "09:30");
+    const hourWindow = { ...rules, payment_window_minutes: 60 };
+    expect(codes(soon, "GCASH", hourWindow)).toEqual(["PAY_FIRST"]);
+    expect(codes(soon, "GCASH", rules)).toEqual([]); // starts exactly when a 30-minute window ends
+    expect(codes(soon, "GCASH", hourWindow, NOW, "1009876543210")).toEqual([]);
+    expect(
+      checkSlotAgainstCourt({ ...soon, payment_method: "CASH_ON_COURT" }, hourWindow, NOW).map((i) => i.code),
+    ).toEqual([]);
+  });
+
+  it("COURT_CLOSED during a closure (half-open ranges)", () => {
+    const closed = {
+      ...rules,
+      closures: [
+        {
+          starts_at: slot("2026-10-19", "15:00", "17:00").start_time,
+          ends_at: slot("2026-10-19", "15:00", "17:00").end_time,
+        },
+      ],
+    };
+    expect(codes(slot("2026-10-19", "16:00", "17:00"), "GCASH", closed)).toEqual(["COURT_CLOSED"]);
+    expect(codes(slot("2026-10-19", "17:00", "18:00"), "GCASH", closed)).toEqual([]);
+  });
+
+  it("messages match the database's text", () => {
+    const [issue] = checkSlotAgainstCourt(
+      { ...slot("2026-10-19", "05:00", "06:00"), payment_method: "GCASH" },
+      rules,
+      NOW,
+    );
+    expect(issue).toEqual({
+      code: "VENUE_CLOSED",
+      message: "The venue is closed during part of the selected time.",
+    });
+    expect(slotIssueToError(issue!)).toEqual({
+      code: "VENUE_CLOSED",
+      message: "The venue is closed during part of the selected time.",
+      field: "start_time",
+      retryable: false,
+    });
   });
 
   it("derives accepted methods from the venue row", () => {
@@ -194,6 +266,23 @@ describe("payment submission & review", () => {
     ["short GCash ref", { payment_ref_no: "123456" }],
   ])("rejects %s", (_label, over) => {
     expect(paymentSubmissionSchema.safeParse({ ...submission, ...over }).success).toBe(false);
+  });
+
+  it("accepts the reference alone; the receipt can be attached later", () => {
+    const { receipt_path: _omit, ...refOnly } = submission;
+    expect(toPaymentSubmissionUpdate(paymentSubmissionSchema.parse(refOnly))).toEqual({
+      payment_ref_no: "1009876543210",
+      payment_status: "AWAITING_VERIFICATION",
+    });
+    expect(
+      receiptAttachSchema.safeParse({ booking_id: BOOKING, receipt_path: `${BOOKING}/later.png` }).success,
+    ).toBe(true);
+    expect(
+      receiptAttachSchema.safeParse({
+        booking_id: BOOKING,
+        receipt_path: "30000000-0000-4000-a000-000000000099/x.png",
+      }).success,
+    ).toBe(false);
   });
 
   it("requires a reason to reject and maps every decision", () => {
@@ -254,7 +343,7 @@ describe("describeBooking / canPlayerCancel", () => {
       nextAction: "PAY",
     });
     expect(describeBooking(b, NOW).detail).toBe("Send ₱1,300.00 by 8:30 AM to keep this slot.");
-    expect(describeBooking(b, new Date("2026-10-13T00:31:00Z")).label).toBe("Payment window closed");
+    expect(describeBooking(b, new Date("2026-10-13T00:35:00Z")).label).toBe("Payment window closed");
     expect(describeBooking({ ...b, payment_status: "AWAITING_VERIFICATION" }, NOW).nextAction).toBe(
       "WAIT_FOR_VERIFICATION",
     );
@@ -277,12 +366,55 @@ describe("describeBooking / canPlayerCancel", () => {
     ).toBe("Expired");
   });
 
-  it("mirrors the guard's cancellation cutoff", () => {
-    const confirmed = { booking_status: "CONFIRMED" as const, start_time: "2026-10-14T00:00:00Z" };
+  it("mirrors the guard's cancellation rules", () => {
+    const confirmed = {
+      booking_status: "CONFIRMED" as const,
+      payment_status: "PAID" as const,
+      start_time: "2026-10-14T00:00:00Z",
+    };
+    const hold = {
+      ...confirmed,
+      booking_status: "PENDING_PAYMENT" as const,
+      payment_status: "UNPAID" as const,
+    };
+    const afterCutoff = new Date("2026-10-13T00:00:01Z");
     expect(canPlayerCancel(confirmed, 24, NOW)).toBe(true);
-    expect(canPlayerCancel(confirmed, 24, new Date("2026-10-13T00:00:01Z"))).toBe(false);
-    expect(canPlayerCancel({ ...confirmed, booking_status: "PENDING_PAYMENT" }, 24, NOW)).toBe(true);
+    expect(canPlayerCancel(confirmed, 24, afterCutoff)).toBe(false);
+    expect(canPlayerCancel(hold, 24, afterCutoff)).toBe(true);
+    // Once the money was sent, the cutoff applies even before verification.
+    expect(canPlayerCancel({ ...hold, payment_status: "AWAITING_VERIFICATION" }, 24, afterCutoff)).toBe(
+      false,
+    );
+    // Never after the start.
+    expect(canPlayerCancel(hold, 24, new Date("2026-10-14T00:00:00Z"))).toBe(false);
     expect(canPlayerCancel({ ...confirmed, booking_status: "COMPLETED" }, 24, NOW)).toBe(false);
+
+    expect(cancellationTerms(confirmed, 24, NOW)).toEqual({
+      allowed: true,
+      refundEligible: true,
+      cutoffAt: "2026-10-13T00:00:00.000Z",
+    });
+    expect(cancellationTerms(hold, 24, NOW)).toEqual({
+      allowed: true,
+      refundEligible: false,
+      cutoffAt: null,
+    });
+  });
+
+  it("an unpaid hold stays 'awaiting payment' through the grace period", () => {
+    const due = "2026-10-13T00:00:00Z";
+    const hold = {
+      booking_status: "PENDING_PAYMENT" as const,
+      payment_status: "UNPAID" as const,
+      payment_method: "GCASH" as const,
+      payment_due_at: due,
+      payment_rejection_reason: null,
+      cancellation_reason: null,
+      total_amount: 500,
+    };
+    expect(describeBooking(hold, new Date("2026-10-13T00:04:59Z")).nextAction).toBe("PAY");
+    expect(describeBooking(hold, new Date("2026-10-13T00:05:00Z")).label).toBe("Payment window closed");
+    expect(holdEndsAt(due).toISOString()).toBe("2026-10-13T00:05:00.000Z");
   });
 });
 
@@ -413,5 +545,41 @@ describe("validate()", () => {
       // Zod 4 keeps evaluating cross-field rules after format errors, so users see everything at once.
       expect(Object.keys(r.fieldErrors ?? {})).toEqual(["court_id", "payment_ref_no"]);
     }
+  });
+});
+
+describe("staffBookingSchema (front desk)", () => {
+  const base = {
+    court_id: COURT,
+    ...slot("2026-10-19", "18:00", "19:00"),
+    payment_method: "CASH_ON_COURT",
+    idempotency_key: "aaaaaaaa-0000-4000-a000-000000000001",
+  } as const;
+
+  it("accepts walk-ins with a normalised phone, and past times (recording a session)", () => {
+    const parsed = staffBookingSchema.parse({
+      ...base,
+      ...slot("2026-10-01", "18:00", "19:00"),
+      walk_in_name: "  Ate   Lorna ",
+      walk_in_phone: "0917 123 4567",
+      mark_paid: true,
+    });
+    expect(parsed).toMatchObject({
+      walk_in_name: "Ate Lorna",
+      walk_in_phone: "+639171234567",
+      mark_paid: true,
+    });
+  });
+
+  it.each([
+    ["a phone without a name", { walk_in_phone: "09171234567" }, "walk_in_name"],
+    ["both a registered player and a walk-in", { booked_by: ALICE, walk_in_name: "Lorna" }, "walk_in_name"],
+    ["a coach on someone else's booking", { booked_by: ALICE, coach_id: ALICE }, "coach_id"],
+    ["a negative discount", { discount_amount: -1 }, "discount_amount"],
+    ["no idempotency key", { idempotency_key: undefined }, "idempotency_key"],
+  ])("rejects %s", (_label, over, field) => {
+    const r = staffBookingSchema.safeParse({ ...base, ...over });
+    expect(r.success).toBe(false);
+    expect(Object.keys(toFieldErrors(r.error!))).toContain(field);
   });
 });
