@@ -166,7 +166,7 @@ PGDATABASE=rackethub_test npm run test:contract
 
 | Item | Note |
 |---|---|
-| Inserting bookings | `bookings.court_amount`, `total_amount` and `venue_id` are NOT NULL but filled by the BEFORE INSERT guard, so the generated `Insert` type requires them. `PlayerBookingInsert` deliberately omits them. Step 3 should create bookings through a `create_booking` RPC (or a typed server action) rather than casting |
+| Inserting bookings | ✅ Step 3: bookings are created through the `create_booking` RPC (`src/server/bookings/create.ts`), whose generated `Args` type needs no amounts |
 | Maya reference format | Validated with the generic 6–40 alphanumeric rule. Tighten once a real Maya receipt format is confirmed |
 | Minimum age | `birth_date` is only checked for being a real past date. A minimum age is a policy decision (minors and RA 10173 consent) |
 | Localisation | Labels are English and keyed by enum value, ready for Filipino/Tagalog copy |

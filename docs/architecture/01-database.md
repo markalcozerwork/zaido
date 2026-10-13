@@ -283,8 +283,8 @@ development. Production must load the official PSA PSGC file.
 | Step | Item |
 |---|---|
 | 2 | Zod schemas generated against these enums and CHECK limits. Map SQLSTATEs (`23P01` slot taken, `23514` rule violated, `42501` forbidden, `40001` retry) to typed errors |
-| 3 | Booking server action: `quote` → `insert` → handle `23P01`. Retry `40001`. Realtime **Broadcast** of busy ranges per court (Postgres Changes can't carry other players' bookings through RLS) |
-| 3 | Clinics that occupy a coach should also block the coach's private bookings (cross-table; needs a trigger or a shared calendar table) |
+| 3 | ✅ Booking server action, retries, Realtime **Broadcast** of busy ranges per court: `create_booking` RPC + `src/server/bookings` ([03-booking-engine.md](03-booking-engine.md)) |
+| 3 | ✅ Clinics block the coach's private bookings and vice versa: the `app.coach_commitments` ledger ([03-booking-engine.md §5](03-booking-engine.md#5-coaches-one-ledger-one-constraint)) |
 | 4 | Inbox RPC with unread counts (`last_read_at`), keyset pagination on `(channel_id, created_at, id)` |
 | 5 | Atomic `rotate_court()` RPC for the paddle queue (N off → back of line, next N on) |
 | Later | PSGC importer · coach reviews · tournament bracket matches · private-club join requests · DM block/report · account-deletion anonymisation (bookings are financial records and are retained) |
