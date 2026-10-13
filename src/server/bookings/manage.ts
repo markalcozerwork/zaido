@@ -1,6 +1,7 @@
 /**
- * After booking: cancel (player), reschedule (venue staff), "My bookings",
- * and court closures (venue staff).
+ * After booking: cancel (player, the booked coach, or venue staff), reschedule
+ * (venue staff), "My bookings", a coach's sessions, and court closures (venue
+ * staff).
  */
 import {
   bookingCancellationSchema,
@@ -30,7 +31,12 @@ export interface CancelOutcome {
   refundDue: boolean;
 }
 
-/** The guard enforces the rules (never after start; the venue's cutoff once paid or under review). */
+/**
+ * Cancel a booking. The guard decides who may: the player (never after start;
+ * the venue's cutoff once paid or under review, lifted while the court is
+ * closed), the booked coach (before start), or venue staff (any time; a live
+ * event using the booking is cancelled with it).
+ */
 export async function cancelBooking(
   client: DbClient,
   input: unknown,
@@ -124,14 +130,75 @@ export async function listMyBookings(
   };
 }
 
+export type CoachSession = BookingRow & {
+  court: { id: string; name: string; venue: Pick<Row<"venues">, "id" | "name" | "timezone"> } | null;
+  player: { id: string; full_name: string } | null;
+};
+
+/** A coach's own sessions (bookings players made with them), so they can prepare or cancel. */
+export async function listMyCoachSessions(
+  client: DbClient,
+  input: { userId: string; scope: "upcoming" | "past" },
+  deps: ServerDeps = {},
+): Promise<ActionResult<CoachSession[]>> {
+  if (!uuidSchema.safeParse(input.userId).success) {
+    return {
+      ok: false,
+      error: { code: "UNAUTHENTICATED", message: "Please sign in again.", retryable: false },
+    };
+  }
+  const now = (deps.now ?? (() => new Date()))();
+  const res = await callWithRetry<CoachSession[]>((signal) => {
+    let q = client
+      .from("bookings")
+      .select(
+        "*, court:courts!bookings_court_id_fkey(id, name, venue:venues!courts_venue_id_fkey(id, name, timezone)), " +
+          "player:profiles!bookings_booked_by_fkey(id, full_name)",
+      )
+      .eq("coach_id", input.userId);
+    q =
+      input.scope === "upcoming"
+        ? q
+            .gt("end_time", now.toISOString())
+            .in("booking_status", ["PENDING_PAYMENT", "CONFIRMED"])
+            .order("start_time", { ascending: true })
+        : q
+            .or(`end_time.lte.${now.toISOString()},booking_status.in.(CANCELLED,COMPLETED)`)
+            .order("start_time", { ascending: false });
+    return q.limit(100).abortSignal(signal).retry(false).overrideTypes<CoachSession[], { merge: false }>();
+  }, deps.retry);
+  return res;
+}
+
 // -----------------------------------------------------------------------------
 // Court closures (venue staff)
 // -----------------------------------------------------------------------------
+export type AffectedBooking = Pick<
+  BookingRow,
+  | "id"
+  | "reference_code"
+  | "court_id"
+  | "start_time"
+  | "end_time"
+  | "booking_status"
+  | "payment_status"
+  | "walk_in_name"
+> & { player: { id: string; full_name: string } | null };
+
+export interface ClosureOutcome {
+  closure: Row<"court_closures">;
+  /**
+   * Live bookings inside the closure: players can no longer pay for them and may cancel
+   * whatever the cutoff; staff should contact them, cancel and refund (bulk cancel is Step 5).
+   */
+  affected: AffectedBooking[];
+}
+
 export async function createClosure(
   client: DbClient,
   input: unknown,
   deps: ServerDeps = {},
-): Promise<ActionResult<Row<"court_closures">>> {
+): Promise<ActionResult<ClosureOutcome>> {
   const v = validate(courtClosureSchema, input);
   if (!v.ok) return v;
   // Not retried on a lost response: a second insert would add a duplicate closure.
@@ -146,7 +213,28 @@ export async function createClosure(
         .single(),
     { ...deps.retry, maxAttempts: 1 },
   );
-  return res;
+  if (!res.ok) return res;
+  const closure = res.data;
+  const affected = await callWithRetry<AffectedBooking[]>((signal) => {
+    let q = client
+      .from("bookings")
+      .select(
+        "id, reference_code, court_id, start_time, end_time, booking_status, payment_status, walk_in_name, " +
+          "player:profiles!bookings_booked_by_fkey(id, full_name)",
+      )
+      .eq("venue_id", closure.venue_id)
+      .in("booking_status", ["PENDING_PAYMENT", "CONFIRMED"])
+      .lt("start_time", closure.ends_at)
+      .gt("end_time", closure.starts_at);
+    if (closure.court_id) q = q.eq("court_id", closure.court_id);
+    return q
+      .order("start_time", { ascending: true })
+      .abortSignal(signal)
+      .retry(false)
+      .overrideTypes<AffectedBooking[], { merge: false }>();
+  }, deps.retry);
+  // The closure exists either way; a failed lookup just leaves the list empty for a refresh.
+  return { ok: true, data: { closure, affected: affected.ok ? affected.data : [] } };
 }
 
 export async function deleteClosure(

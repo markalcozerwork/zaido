@@ -156,6 +156,16 @@ const CONSTRAINTS: Record<string, Omit<DomainError, "retryable" | "cause">> = {
     message: "Give a reason (3–200 characters).",
     field: "reason",
   },
+  bookings_notes_length: {
+    code: "VALIDATION_FAILED",
+    message: "Notes can be at most 500 characters.",
+    field: "notes",
+  },
+  bookings_cancellation_reason_length: {
+    code: "VALIDATION_FAILED",
+    message: "Keep the reason under 300 characters.",
+    field: "reason",
+  },
   bookings_payment_ref_unique: {
     code: "PAYMENT_REF_ALREADY_USED",
     message: "This reference number was already used for another booking. Double-check your receipt.",
@@ -211,7 +221,7 @@ const CONSTRAINTS: Record<string, Omit<DomainError, "retryable" | "cause">> = {
 
 /** Messages Postgres writes itself. Anything else with these codes came from our guards and is user-facing. */
 const SYSTEM_MESSAGE =
-  /violates (check|exclusion|foreign key|unique|not-null|row-level security)|permission denied|duplicate key|conflicting key|null value in column/i;
+  /violates (check|exclusion|foreign key|unique|not-null|row-level security)|permission denied|duplicate key|conflicting key|null value in column|invalid input (syntax|value)|out of range|malformed|does not exist/i;
 
 function constraintName(err: DatabaseErrorLike): string | undefined {
   if (err.constraint) return err.constraint;
@@ -293,8 +303,10 @@ export function mapDatabaseError(err: DatabaseErrorLike): DomainError {
         message: "We're handling a lot of requests. Please try again.",
         retryable: true,
       };
+    // JWT invalid (301), anonymous access off (302), claims rejected, e.g. expired (303).
     case "PGRST301":
     case "PGRST302":
+    case "PGRST303":
       return { ...base, code: "UNAUTHENTICATED", message: "Please sign in again." };
     default:
       return { ...base, code: "UNKNOWN", message: "Something went wrong. Please try again." };

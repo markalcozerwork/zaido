@@ -40,15 +40,20 @@ docs/architecture/     design notes per step
 
 ```bash
 npm ci
-npm run check                      # typecheck + format + 156 unit tests
+npm run check                      # typecheck + format + 239 unit tests
 
 # Database (any Postgres 15+ superuser)
 export PGHOST=localhost PGUSER=postgres PGPASSWORD=postgres
-npm run db:verify                  # migrations + 167 SQL assertions + concurrency races
+npm run db:verify                  # migrations + SQL suite + 10 concurrency races (311 checks)
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rackethub_test npm run db:types:check
-PGDATABASE=rackethub_test npm run test:contract   # 62 Zod ↔ Postgres contract tests
+PGDATABASE=rackethub_test npm run test:contract   # 73 Zod ↔ Postgres contract tests
+
+# Server actions through a real PostgREST 13 (downloads a pinned, checksum-verified binary)
+npm run postgrest:fetch
+PGDATABASE=rackethub_test npm run test:integration   # 51 integration tests
 ```
 
 `db:verify` drops and recreates the `rackethub_test` database (override with
 `RH_TEST_DB`). CI (`.github/workflows/ci.yml`) runs all of the above on
-Postgres 15 and 17.
+Postgres 15 and 17. After deploying to a Supabase project, run
+`scripts/post-deploy-check.sql` against it.

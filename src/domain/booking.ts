@@ -574,8 +574,10 @@ export const paymentSubmissionSchema = z
 
 export type PaymentSubmission = z.output<typeof paymentSubmissionSchema>;
 
+/** Paying with another e-wallet than the hold was made with is fine: the method moves with the proof. */
 export function toPaymentSubmissionUpdate(p: PaymentSubmission): UpdateRow<"bookings"> {
   return compact({
+    payment_method: p.payment_method,
     payment_ref_no: p.payment_ref_no,
     payment_receipt_url: p.receipt_path,
     payment_status: "AWAITING_VERIFICATION" as const,
@@ -597,10 +599,26 @@ export function toReceiptAttachUpdate(p: ReceiptAttach): UpdateRow<"bookings"> {
   return { payment_receipt_url: p.receipt_path, payment_status: "AWAITING_VERIFICATION" };
 }
 
+/** The reference exactly as the reviewer saw it in the queue (decisions apply to that proof only). */
+const reviewedRefSchema = z.string().trim().min(1).max(40);
+
 export const paymentReviewSchema = z.discriminatedUnion("decision", [
-  z.strictObject({ decision: z.literal("APPROVE"), booking_id: uuidSchema }),
-  z.strictObject({ decision: z.literal("REJECT"), booking_id: uuidSchema, reason: line(5, 300) }),
+  z.strictObject({
+    decision: z.literal("APPROVE"),
+    booking_id: uuidSchema,
+    payment_ref_no: reviewedRefSchema,
+  }),
+  z.strictObject({
+    decision: z.literal("REJECT"),
+    booking_id: uuidSchema,
+    payment_ref_no: reviewedRefSchema,
+    reason: line(5, 300),
+  }),
+  /** Cash handed over at the desk (also for a hold that was meant to be paid by e-wallet). */
   z.strictObject({ decision: z.literal("MARK_CASH_COLLECTED"), booking_id: uuidSchema }),
+  /** Venues that confirm cash bookings by hand: accept the request. Decline = cancel with a reason. */
+  z.strictObject({ decision: z.literal("CONFIRM_CASH_REQUEST"), booking_id: uuidSchema }),
+  /** Money returned. Before play this also cancels the booking; after play it stays completed. */
   z.strictObject({ decision: z.literal("REFUND"), booking_id: uuidSchema }),
 ]);
 
@@ -610,14 +628,56 @@ export type PaymentReview = z.output<typeof paymentReviewSchema>;
 export function toPaymentReviewUpdate(review: PaymentReview): UpdateRow<"bookings"> {
   switch (review.decision) {
     case "APPROVE":
-    case "MARK_CASH_COLLECTED":
       return { payment_status: "PAID" };
+    case "MARK_CASH_COLLECTED":
+      return { payment_method: "CASH_ON_COURT", payment_status: "PAID" };
+    case "CONFIRM_CASH_REQUEST":
+      return { booking_status: "CONFIRMED" };
     case "REJECT":
       return { payment_status: "REJECTED", payment_rejection_reason: review.reason };
     case "REFUND":
       return { payment_status: "REFUNDED" };
   }
 }
+
+/**
+ * Compare-and-set guard for a review: the UPDATE only matches while the booking
+ * is still in a state the decision was made for (a retry of the same decision
+ * still matches). A stale click (another reviewer acted, the player resubmitted)
+ * matches nothing and the action reports "refresh".
+ */
+export function reviewPrecondition(review: PaymentReview): {
+  eq: Partial<Record<"payment_ref_no" | "payment_method", string>>;
+  in: Partial<Record<"payment_status" | "booking_status", readonly string[]>>;
+} {
+  switch (review.decision) {
+    case "APPROVE":
+      return {
+        eq: { payment_ref_no: review.payment_ref_no },
+        in: { payment_status: ["AWAITING_VERIFICATION", "PAID"] },
+      };
+    case "REJECT":
+      return {
+        eq: { payment_ref_no: review.payment_ref_no },
+        in: { payment_status: ["AWAITING_VERIFICATION", "REJECTED"] },
+      };
+    case "MARK_CASH_COLLECTED":
+      return { eq: {}, in: { payment_status: ["UNPAID", "REJECTED", "PAID"] } };
+    case "CONFIRM_CASH_REQUEST":
+      return {
+        eq: { payment_method: "CASH_ON_COURT" },
+        in: { booking_status: ["PENDING_PAYMENT", "CONFIRMED"] },
+      };
+    case "REFUND":
+      return { eq: {}, in: { payment_status: ["PAID", "REFUNDED"] } };
+  }
+}
+
+/** Switch how to pay while nothing was paid yet (the database checks the venue accepts it). */
+export const paymentMethodSwitchSchema = z.strictObject({
+  booking_id: uuidSchema,
+  payment_method: paymentMethodSchema,
+});
 
 export const bookingCancellationSchema = z.strictObject({
   booking_id: uuidSchema,
@@ -633,7 +693,13 @@ export function toCancellationUpdate(c: z.output<typeof bookingCancellationSchem
 // -----------------------------------------------------------------------------
 export type BookingTone = "success" | "info" | "warning" | "danger" | "neutral";
 export type BookingNextAction =
-  "PAY" | "RESUBMIT_PAYMENT" | "WAIT_FOR_VERIFICATION" | "PAY_AT_VENUE" | "NONE";
+  | "PAY"
+  | "RESUBMIT_PAYMENT"
+  | "WAIT_FOR_VERIFICATION"
+  | "PAY_AT_VENUE"
+  /** The e-wallet hold ran out: if the player paid anyway, rebookExpiredHold with the reference. */
+  | "REBOOK"
+  | "NONE";
 
 export interface BookingView {
   label: string;
@@ -667,8 +733,16 @@ export function describeBooking(b: BookingStateFields, now: Date = new Date()): 
       if (b.cancellation_reason === "PAYMENT_WINDOW_EXPIRED") {
         return {
           label: "Expired",
-          detail: "Payment wasn't received in time.",
+          detail: "Payment wasn't received in time. Already paid? Book again with your reference number.",
           tone: "danger",
+          nextAction: cash ? "NONE" : "REBOOK",
+        };
+      }
+      if (b.payment_status === "PAID" || b.payment_status === "AWAITING_VERIFICATION") {
+        return {
+          label: "Cancelled · Refund pending",
+          detail: "The venue will return your payment.",
+          tone: "warning",
           nextAction: "NONE",
         };
       }
@@ -678,7 +752,11 @@ export function describeBooking(b: BookingStateFields, now: Date = new Date()): 
         nextAction: "NONE",
       };
     case "COMPLETED":
-      return { label: "Completed", tone: "neutral", nextAction: "NONE" };
+      return {
+        label: b.payment_status === "REFUNDED" ? "Completed · Refunded" : "Completed",
+        tone: "neutral",
+        nextAction: "NONE",
+      };
     case "CONFIRMED":
       return cash && b.payment_status === "UNPAID"
         ? {
@@ -700,7 +778,12 @@ export function describeBooking(b: BookingStateFields, now: Date = new Date()): 
       }
       // The slot is held until the due time plus a short grace (app.hold_grace()).
       if (b.payment_due_at && holdEndsAt(b.payment_due_at) <= now) {
-        return { label: "Payment window closed", tone: "danger", nextAction: "NONE" };
+        return {
+          label: "Payment window closed",
+          detail: "Already paid? Book again with your reference number.",
+          tone: "danger",
+          nextAction: "REBOOK",
+        };
       }
       if (b.payment_status === "REJECTED") {
         return {
@@ -726,10 +809,13 @@ export function holdEndsAt(paymentDueAt: string | Date): Date {
   return addMinutes(new Date(paymentDueAt), LIMITS.booking.holdGraceMinutes);
 }
 
-type CancellableFields = Pick<Row<"bookings">, "booking_status" | "payment_status" | "start_time">;
+type CancellableFields = Pick<Row<"bookings">, "booking_status" | "payment_status" | "start_time"> &
+  Partial<Pick<Row<"bookings">, "reserved_for_event_id">>;
 
 export interface CancellationTerms {
   allowed: boolean;
+  /** Why not, when not allowed by a rule the player can act on. */
+  blockedBy?: "EVENT" | "STARTED" | "CUTOFF";
   /** Money was sent (verified or not), so the venue owes a refund if the player cancels. */
   refundEligible: boolean;
   /** Last moment a player may cancel, when a cutoff applies (confirmed, or payment sent). */
@@ -738,9 +824,11 @@ export interface CancellationTerms {
 
 /**
  * Mirror of the guard's player-cancel rules:
+ *   * never while it holds the court for a live event (cancel the event first);
  *   * never once the session has started;
  *   * a confirmed booking, or one whose payment was sent (under review), only
- *     up to the venue's cutoff before start;
+ *     up to the venue's cutoff before start (the database also lifts the
+ *     cutoff while the venue has the court closed);
  *   * an unpaid hold any time before start.
  */
 export function cancellationTerms(
@@ -753,9 +841,19 @@ export function cancellationTerms(
   const moneySent = b.payment_status === "PAID" || b.payment_status === "AWAITING_VERIFICATION";
   const cutoffApplies = b.booking_status === "CONFIRMED" || b.payment_status === "AWAITING_VERIFICATION";
   const cutoff = addMinutes(start, -cancellationCutoffHours * 60);
-  const allowed = live && now < start && (!cutoffApplies || now <= cutoff);
+  const blockedBy = !live
+    ? undefined
+    : b.reserved_for_event_id
+      ? ("EVENT" as const)
+      : now >= start
+        ? ("STARTED" as const)
+        : cutoffApplies && now > cutoff
+          ? ("CUTOFF" as const)
+          : undefined;
+  const allowed = live && !blockedBy;
   return {
     allowed,
+    ...(blockedBy ? { blockedBy } : {}),
     refundEligible: allowed && moneySent,
     cutoffAt: cutoffApplies ? cutoff.toISOString() : null,
   };

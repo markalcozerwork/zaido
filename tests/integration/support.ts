@@ -40,12 +40,18 @@ function postgrestFetch(postgrestUrl: string): typeof fetch {
 export interface ClientOptions {
   /** Wrap the transport, e.g. to simulate a response lost on a flaky mobile network. */
   wrapFetch?: (f: typeof fetch) => typeof fetch;
+  /** Sign a token that expired a minute ago (an app resumed after the session lapsed). */
+  expired?: boolean;
 }
 
 /** A supabase-js client signed in as `userId`, or anonymous when null. */
 export function clientAs(userId: string | null, opts: ClientOptions = {}): DbClient {
+  const past = Math.floor(Date.now() / 1000) - 3600;
   const jwt = signJwt(
-    userId ? { sub: userId, role: "authenticated" } : { role: "anon" },
+    {
+      ...(userId ? { sub: userId, role: "authenticated" } : { role: "anon" }),
+      ...(opts.expired ? { iat: past, exp: past + 60 } : {}),
+    },
     inject("jwtSecret"),
   );
   const base = postgrestFetch(inject("postgrestUrl"));
@@ -200,11 +206,13 @@ export async function updateRow(table: string, id: string, values: Record<string
 /** A verified pickleball coach (₱800/h), optionally with weekly availability windows. */
 export async function createCoach(
   windows: Array<{ day_of_week: number; start_time: string; end_time: string }> = [],
+  opts: { sports?: string; offersPrivate?: boolean } = {},
 ): Promise<string> {
   const id = await createUser("Integration Coach");
   await sql(
-    `insert into public.coach_profiles (profile_id, sports_coached, hourly_rate, verified_status) values ($1, '{PICKLEBALL}', 800, 'VERIFIED')`,
-    [id],
+    `insert into public.coach_profiles (profile_id, sports_coached, hourly_rate, verified_status, offers_private, offers_group_clinics)
+     values ($1, $2, 800, 'VERIFIED', $3, true)`,
+    [id, opts.sports ?? "{PICKLEBALL}", opts.offersPrivate ?? true],
   );
   for (const w of windows) {
     await sql(

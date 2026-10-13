@@ -11,6 +11,14 @@
 #   3. Same as 2 under REPEATABLE READ
 #      → never more than 5 seats; the losers get 40001 (retryable) or the
 #        waitlist; counters == actual rows.
+#   Step 3:
+#   4. one checkout double-tapped N times → 1 booking, every call the same id
+#   5. coached bookings vs clinics for one coach (REPEATABLE READ) → 1 commitment
+#   6. publish an event vs cancel its booking (RC + RR) → no write skew
+#   7. N players through create_booking → 1 booked, N-1 clean SLOT_TAKEN
+#   8. double-tap at hold cap - 1 → no false HOLD_LIMIT_REACHED
+#   9. N checkouts by one player at a 2-hold venue → exactly 2
+#  10. publish an event vs the venue moving its booking (RC + RR) → no write skew
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -305,3 +313,47 @@ held=$(qa -c "select count(*) from public.bookings where booked_by = '00000000-0
 [[ "$okcalls" -eq 2 && "$capped" -eq $(( N - 2 )) && "$held" -eq 2 ]] \
   || { for i in $(seq 1 "$N"); do sed 's/^/    /' "$WORK/cap2.$i.out"; done | sort | uniq -c | head; fail "hold cap race: ok=$okcalls capped=$capped held=$held"; }
 echo "  ok - $N simultaneous checkouts by one player at a 2-hold venue: exactly 2 holds, $capped HOLD_LIMIT_REACHED"
+
+# --- 10. Event link vs venue reschedule (write-skew check), RC and RR -----------
+# Staff move booking B while its organiser publishes event E on it. Either the
+# move goes first and the publish fails (B no longer covers E), or the publish
+# goes first and the move is refused: never a live event on court time it
+# doesn't hold.
+q >/dev/null <<SQL
+insert into public.bookings (id, court_id, booked_by, created_by, start_time, end_time, payment_method)
+select ('30000000-0000-4000-c000-' || lpad((100 + g)::text, 12, '0'))::uuid, ('20000000-0000-4000-c000-' || lpad(g::text, 12, '0'))::uuid,
+       ('00000000-0000-4000-b000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-4000-b000-' || lpad(g::text, 12, '0'))::uuid,
+       tests.slot(3, '14:00'), tests.slot(3, '16:00'), 'CASH_ON_COURT'
+  from generate_series(1, 12) g;
+insert into public.events (id, organizer_id, venue_id, court_id, booking_id, title, sport, event_type, status, start_time, end_time, max_participants)
+select ('50000000-0000-4000-c000-' || lpad((100 + g)::text, 12, '0'))::uuid, ('00000000-0000-4000-b000-' || lpad(g::text, 12, '0'))::uuid,
+       '10000000-0000-4000-a000-000000000001', ('20000000-0000-4000-c000-' || lpad(g::text, 12, '0'))::uuid,
+       ('30000000-0000-4000-c000-' || lpad((100 + g)::text, 12, '0'))::uuid, 'Move race ' || g, 'PICKLEBALL', 'OPEN_PLAY', 'DRAFT',
+       tests.slot(3, '14:00'), tests.slot(3, '16:00'), 4
+  from generate_series(1, 12) g;
+SQL
+GO="$(start_at)"
+for i in $(seq 1 12); do
+  iso=$([[ $i -le 6 ]] && echo "read committed" || echo "repeatable read")
+  b="$(printf '30000000-0000-4000-c000-%012d' $(( 100 + i )))"
+  e="$(printf '50000000-0000-4000-c000-%012d' $(( 100 + i )))"
+  ( set +e   # the venue moves the booking 4 hours later, holding the row lock for a moment
+    q -c "set role authenticated" -c "select tests.login('mia')" -c "$(barrier "$GO")" \
+      -c "begin isolation level $iso" \
+      -c "update public.bookings set start_time = start_time + interval '4 hours', end_time = end_time + interval '4 hours' where id = '$b'" \
+      -c "select pg_sleep(0.4)" -c "commit" >"$WORK/move.$i.staff.out" 2>&1 ) &
+  ( set +e   # the organiser publishes the event a moment later
+    q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" -c "select pg_sleep(0.1)" \
+      -c "begin isolation level $iso" -c "update public.events set status = 'SCHEDULED' where id = '$e'" -c "commit" \
+      >"$WORK/move.$i.org.out" 2>&1 ) &
+done
+wait
+skew=$(qa -c "
+  select count(*) from public.events e join public.bookings b on b.id = e.booking_id
+   where e.id::text like '50000000-0000-4000-c000-0000000001%'
+     and e.status = 'SCHEDULED'
+     and not (b.booking_status = 'CONFIRMED' and b.reserved_for_event_id = e.id and b.court_id = e.court_id
+              and b.time_range @> tstzrange(e.start_time, e.end_time, '[)'))")
+published=$(qa -c "select count(*) from public.events where id::text like '50000000-0000-4000-c000-0000000001%' and status = 'SCHEDULED'")
+[[ "$skew" -eq 0 ]] || { sed 's/^/    /' "$WORK"/move.1.*.out | head; fail "link vs reschedule: $skew live events on court time their booking no longer holds"; }
+echo "  ok - 12 publish-vs-reschedule races (6 READ COMMITTED, 6 REPEATABLE READ): $published published, 0 live events on court time they don't hold"

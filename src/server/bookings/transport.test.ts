@@ -240,3 +240,70 @@ describe("createBooking", () => {
     ).toEqual(["p_court_id", "p_start", "p_end", "p_payment_method", "p_idempotency_key"]);
   });
 });
+
+describe("error mapping fixes", () => {
+  it("an expired session (PGRST303) asks the user to sign in again", async () => {
+    const { mapDatabaseError } = await import("../../domain");
+    expect(mapDatabaseError({ code: "PGRST303", message: "JWT expired" })).toMatchObject({
+      code: "UNAUTHENTICATED",
+    });
+  });
+
+  it("never shows Postgres's own text (it echoes the caller's input)", async () => {
+    const { mapDatabaseError } = await import("../../domain");
+    for (const message of [
+      'invalid input syntax for type uuid: "1 or 1=1"',
+      "date/time field value out of range",
+    ]) {
+      const e = mapDatabaseError({ code: "22P02", message });
+      expect(e.code).toBe("VALIDATION_FAILED");
+      expect(e.message).toBe("Some of the details are invalid.");
+    }
+  });
+
+  it("maps the new length constraints to their fields", async () => {
+    const { mapDatabaseError } = await import("../../domain");
+    expect(
+      mapDatabaseError({
+        code: "23514",
+        message: 'new row for relation "bookings" violates check constraint "bookings_notes_length"',
+      }),
+    ).toMatchObject({ code: "VALIDATION_FAILED", field: "notes" });
+  });
+});
+
+describe("fetchAllPages", () => {
+  it("pages below PostgREST's row cap until a short page", async () => {
+    const { fetchAllPages } = await import("./availability");
+    const rows = Array.from({ length: 1234 }, (_, i) => i);
+    const ranges: Array<[number, number]> = [];
+    const res = await fetchAllPages<number>(
+      (from, to) => async () => {
+        ranges.push([from, to]);
+        return { data: rows.slice(from, to + 1), error: null, status: 200 };
+      },
+      {},
+      500,
+    );
+    expect(res).toEqual({ ok: true, data: rows });
+    expect(ranges).toEqual([
+      [0, 499],
+      [500, 999],
+      [1000, 1499],
+    ]);
+  });
+});
+
+describe("inboxKind", () => {
+  it("sorts the venue's to-dos", async () => {
+    const { inboxKind } = await import("./payments");
+    expect(inboxKind({ booking_status: "PENDING_PAYMENT", payment_status: "AWAITING_VERIFICATION" })).toBe(
+      "PROOF",
+    );
+    expect(inboxKind({ booking_status: "CANCELLED", payment_status: "AWAITING_VERIFICATION" })).toBe(
+      "SETTLE",
+    );
+    expect(inboxKind({ booking_status: "CANCELLED", payment_status: "PAID" })).toBe("REFUND_DUE");
+    expect(inboxKind({ booking_status: "PENDING_PAYMENT", payment_status: "UNPAID" })).toBe("CASH_REQUEST");
+  });
+});

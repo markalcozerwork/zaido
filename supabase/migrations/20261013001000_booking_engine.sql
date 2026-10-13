@@ -4,7 +4,9 @@
 -- Step 3 hardens booking creation for a concurrent, mobile, partly-hostile world:
 --
 --   1. public.create_booking(): the one entry point the app uses. Idempotent
---      per checkout via INSERT … ON CONFLICT on (created_by, idempotency_key).
+--      per checkout on (created_by, idempotency_key): twins queue on an
+--      advisory lock, then a plain INSERT (ON CONFLICT's speculative insertion
+--      deadlocked against the exclusion constraints).
 --   2. Coach commitments ledger: app.coach_commitments holds one row per live
 --      coached booking and per coach-confirmed clinic/event, behind an
 --      EXCLUDE constraint. Exclusion checks see committed AND in-flight rows
@@ -16,14 +18,18 @@
 --      (events.coach_confirmed_at), so nobody can block a coach with fake events.
 --   4. Event court reservations: an event published on a court must link a
 --      CONFIRMED booking of its organiser. The link is written ONTO the
---      booking row (bookings.reserved_for_event_id) by an UPDATE, so a
---      concurrent cancel/reschedule of that booking serialises on the row
---      lock (READ COMMITTED) or fails with 40001 (REPEATABLE READ). Never
---      write skew.
+--      booking row (bookings.reserved_for_event_id) by an UPDATE that
+--      re-checks the whole link (owner, court, coverage, CONFIRMED) on the
+--      latest row version, so a concurrent cancel or reschedule of that
+--      booking either serialises on the row lock and is re-evaluated (READ
+--      COMMITTED) or fails with 40001 (REPEATABLE READ). Never write skew.
+--      Venue staff cancelling such a booking cancel the event with it.
 --   5. Abuse limits: per-player active-hold cap per venue, late payment
 --      proofs rejected, receipts must be the booking's own uploaded file,
 --      on-behalf bookings only at verified venues and never with a coach,
---      walk-ins without accounts via walk_in_name/phone.
+--      coaches only at verified venues and under player rules even when
+--      staff book them, staff edits re-checked like inserts, walk-ins without
+--      accounts via walk_in_name/phone.
 --   6. Realtime: every change in a court's busy-ness is broadcast on the
 --      PRIVATE topic court:<id>:slots. Receive-only RLS on realtime.messages
 --      means clients can't spoof slot events. Payloads carry times only.
@@ -44,6 +50,25 @@ alter table public.bookings
   add constraint bookings_walk_in_name_length check (walk_in_name is null or char_length(btrim(walk_in_name)) between 2 and 120),
   add constraint bookings_walk_in_phone_format check (walk_in_phone is null or walk_in_phone ~ '^\+63[0-9]{9,10}$'),
   add constraint bookings_walk_in_phone_needs_name check (walk_in_phone is null or walk_in_name is not null);
+
+-- [Step 3] Free text the player controls is bounded server-side too (TS: 500 / 300).
+alter table public.bookings
+  add constraint bookings_notes_length check (notes is null or char_length(notes) <= 500) not valid,
+  add constraint bookings_cancellation_reason_length
+    check (cancellation_reason is null or char_length(cancellation_reason) <= 300) not valid;
+update public.bookings set notes = left(notes, 500) where char_length(notes) > 500;
+update public.bookings set cancellation_reason = left(cancellation_reason, 300) where char_length(cancellation_reason) > 300;
+alter table public.bookings validate constraint bookings_notes_length;
+alter table public.bookings validate constraint bookings_cancellation_reason_length;
+
+-- [Step 3] A refund after play keeps the booking COMPLETED (the record of play
+-- stays); before play it cancels the booking (the guard does that).
+alter table public.bookings drop constraint bookings_completed_requires_payment;
+alter table public.bookings add constraint bookings_completed_requires_payment
+  check (booking_status <> 'COMPLETED' or payment_status in ('PAID', 'REFUNDED'));
+alter table public.bookings drop constraint bookings_refund_only_after_cancel;
+alter table public.bookings add constraint bookings_refund_only_after_cancel
+  check (payment_status <> 'REFUNDED' or booking_status in ('CANCELLED', 'COMPLETED'));
 
 comment on column public.bookings.created_by is 'Who created the row (the player, or venue staff for walk-ins). Stamped by the guard.';
 comment on column public.bookings.idempotency_key is 'Client-generated per checkout attempt; retries with the same key return the same booking.';
@@ -98,6 +123,37 @@ immutable
 parallel safe
 set search_path = ''
 as $$ select interval '5 minutes' $$;
+
+-- The one "is this hold dead?" test (sweeps, busy RPCs, hold cap, late proofs).
+-- NULL-safe: a hold without a deadline (unconfirmed cash at a venue that
+-- confirms by hand) never dies on its own and must keep counting as busy.
+create or replace function app.hold_is_dead(
+  p_booking_status public.booking_status,
+  p_payment_status public.payment_status,
+  p_due            timestamptz
+)
+returns boolean
+language sql
+stable
+set search_path = ''
+as $$
+  select coalesce(p_booking_status = 'PENDING_PAYMENT'
+                  and p_payment_status in ('UNPAID', 'REJECTED')
+                  and p_due is not null
+                  and p_due <= now() - app.hold_grace(), false);
+$$;
+
+-- An event's time range regardless of the caller's RLS (venue staff can't
+-- always see an organiser's private event, but must keep its court covered).
+create or replace function app.event_time_range(p_event_id uuid)
+returns tstzrange
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select tstzrange(e.start_time, e.end_time, '[)') from public.events e where e.id = p_event_id;
+$$;
 
 -- -----------------------------------------------------------------------------
 -- Court closures: typhoon signals, maintenance, barangay events
@@ -282,7 +338,7 @@ $$;
 -- coach's time when a coach is attached. Rows are locked in id order to avoid
 -- deadlocks between concurrent bookings.
 create or replace function app.expire_overlapping_holds(
-  p_court_id uuid, p_coach_id uuid, p_start timestamptz, p_end timestamptz
+  p_court_id uuid, p_coach_id uuid, p_start timestamptz, p_end timestamptz, p_exclude_id uuid default null
 )
 returns integer
 language plpgsql
@@ -299,10 +355,9 @@ begin
    where b.id in (
      select x.id
        from public.bookings x
-      where x.booking_status = 'PENDING_PAYMENT'
-        and x.payment_status in ('UNPAID', 'REJECTED')
-        and x.payment_due_at <= now() - app.hold_grace()
+      where app.hold_is_dead(x.booking_status, x.payment_status, x.payment_due_at)
         and x.reserved_for_event_id is null
+        and x.id is distinct from p_exclude_id
         and x.time_range && tstzrange(p_start, p_end, '[)')
         and (x.court_id = p_court_id or (p_coach_id is not null and x.coach_id = p_coach_id))
       order by x.id
@@ -331,10 +386,7 @@ begin
    where b.id in (
      select x.id
        from public.bookings x
-      where x.booking_status = 'PENDING_PAYMENT'
-        and x.payment_status in ('UNPAID', 'REJECTED')
-        and x.payment_due_at is not null
-        and x.payment_due_at <= now() - app.hold_grace()
+      where app.hold_is_dead(x.booking_status, x.payment_status, x.payment_due_at)
         and x.reserved_for_event_id is null
         and (p_court_id is null or x.court_id = p_court_id)
       order by x.id
@@ -363,8 +415,15 @@ declare
   v_local_start     timestamp;
   v_minutes         integer;
   v_active_holds    integer;
+  v_unpaid_holds    integer;
+  v_in_review       integer;
+  v_pay_at_venue    integer;
+  v_cash_requests   integer;
+  v_coach_actor     boolean := false;
+  v_player_rules    boolean;
+  v_proof_sent      boolean;
   v_booker_editable constant text[] := array[
-    'payment_ref_no', 'payment_receipt_url', 'payment_status', 'booking_status',
+    'payment_ref_no', 'payment_receipt_url', 'payment_status', 'booking_status', 'payment_method',
     'cancellation_reason', 'notes', 'player_count', 'updated_at', 'time_range'
   ];
 begin
@@ -402,11 +461,21 @@ begin
     if new.reserved_for_event_id is distinct from old.reserved_for_event_id and not app.is_trusted_context() then
       raise exception using errcode = '42501', message = 'Event links are managed through the event.';
     end if;
-    -- [Step 3] A booking that holds the court for a live event can't be cancelled or moved.
+    -- [Step 3] A booking that holds the court for a live event can't be cancelled or moved by the
+    -- organiser. Venue staff may cancel it (the event is cancelled with it: typhoon, maintenance)
+    -- or extend/move it on the same court as long as it still covers the event.
     if old.reserved_for_event_id is not null and not v_trusted
        and (v_slot_changed or new.booking_status = 'CANCELLED') then
-      raise exception using errcode = '23514',
-        message = 'COURT_RESERVED_FOR_EVENT: This booking holds the court for an event. Cancel or move the event first.';
+      if not v_manager then
+        raise exception using errcode = '23514',
+          message = 'COURT_RESERVED_FOR_EVENT: This booking holds the court for an event. Cancel or move the event first.';
+      elsif new.booking_status <> 'CANCELLED'
+            and not (new.court_id = old.court_id
+                     and new.coach_id is not distinct from old.coach_id
+                     and tstzrange(new.start_time, new.end_time, '[)') @> app.event_time_range(old.reserved_for_event_id)) then
+        raise exception using errcode = '23514',
+          message = 'COURT_RESERVED_FOR_EVENT: This booking holds the court for an event. Keep the event''s time covered on this court, or cancel the booking (the event is cancelled with it).';
+      end if;
     end if;
 
     if v_slot_changed then
@@ -429,10 +498,55 @@ begin
       new.payment_due_at       := old.payment_due_at;
     end if;
 
-    if not v_manager then
+    -- [Step 3] The booked coach may cancel the session (sick, double-booked offline), nothing else.
+    v_coach_actor := not v_manager and v_actor is not null
+                     and v_actor = old.coach_id and v_actor is distinct from old.booked_by;
+    if v_coach_actor then
+      if (to_jsonb(new) - array['booking_status', 'cancellation_reason', 'updated_at', 'time_range'])
+           is distinct from (to_jsonb(old) - array['booking_status', 'cancellation_reason', 'updated_at', 'time_range'])
+         or new.booking_status <> 'CANCELLED' then
+        raise exception using errcode = '42501', message = 'As the coach you can only cancel this session.';
+      end if;
+      if now() >= old.start_time then
+        raise exception using errcode = '23514',
+          message = 'CANCELLATION_CLOSED: This session has already started. Please contact the venue.';
+      end if;
+      new.cancellation_reason := coalesce(new.cancellation_reason, 'CANCELLED_BY_COACH');
+    end if;
+
+    if not v_manager and not v_coach_actor then
       if (to_jsonb(new) - v_booker_editable) is distinct from (to_jsonb(old) - v_booker_editable) then
         raise exception using errcode = '42501',
           message = 'You can only submit payment details, edit notes, or cancel this booking.';
+      end if;
+
+      v_proof_sent := (new.payment_status = 'AWAITING_VERIFICATION' and new.payment_status is distinct from old.payment_status)
+                   or new.payment_ref_no is distinct from old.payment_ref_no
+                   or new.payment_receipt_url is distinct from old.payment_receipt_url
+                   or new.payment_method is distinct from old.payment_method;
+
+      -- [Step 3] Proof arriving after the hold (plus grace) expired would revive a slot others already
+      -- see as free. Checked first, so it holds whether or not the sweep already cancelled the hold.
+      if v_proof_sent
+         and ((old.booking_status = 'CANCELLED' and old.cancellation_reason = 'PAYMENT_WINDOW_EXPIRED')
+              or app.hold_is_dead(old.booking_status, old.payment_status, old.payment_due_at)) then
+        raise exception using errcode = '23514',
+          message = 'HOLD_EXPIRED: Your hold on this slot has ended. If you already paid, book again with your reference number.';
+      end if;
+
+      -- [Step 3] Nothing to pay for while the court is closed (typhoon, maintenance).
+      if v_proof_sent and old.booking_status = 'PENDING_PAYMENT'
+         and app.court_is_closed(old.court_id, r.venue_id, old.start_time, old.end_time) then
+        raise exception using errcode = '23514',
+          message = 'COURT_CLOSED: The court is closed during this booking. Don''t send payment; cancel it or contact the venue.';
+      end if;
+
+      -- [Step 3] What the venue is checking can't change under it: a different reference only after a rejection.
+      if old.payment_status = 'AWAITING_VERIFICATION'
+         and (new.payment_ref_no is distinct from old.payment_ref_no
+              or (old.payment_receipt_url is not null and new.payment_receipt_url is distinct from old.payment_receipt_url)) then
+        raise exception using errcode = '42501',
+          message = 'PAYMENT_LOCKED: The venue is checking this payment. If the reference is wrong, ask the venue to reject it, then send the right one.';
       end if;
 
       if new.payment_status is distinct from old.payment_status
@@ -440,13 +554,6 @@ begin
                   and old.payment_status in ('UNPAID', 'REJECTED')
                   and old.booking_status = 'PENDING_PAYMENT') then
         raise exception using errcode = '42501', message = 'Only the venue can verify, reject or refund a payment.';
-      end if;
-
-      -- [Step 3] Proof arriving after the hold (plus grace) expired would revive a slot others already see as free.
-      if new.payment_status = 'AWAITING_VERIFICATION' and old.payment_status in ('UNPAID', 'REJECTED')
-         and old.payment_due_at is not null and old.payment_due_at <= now() - app.hold_grace() then
-        raise exception using errcode = '23514',
-          message = 'HOLD_EXPIRED: Your hold on this slot has ended. If you already paid, book again with your reference number.';
       end if;
 
       if (new.payment_ref_no is distinct from old.payment_ref_no
@@ -465,13 +572,90 @@ begin
           raise exception using errcode = '23514',
             message = 'CANCELLATION_CLOSED: This booking has already started. Please contact the venue.';
         end if;
-        -- [Step 3] The cutoff also applies once money has been sent, verified or not.
+        -- [Step 3] The cutoff also applies once money has been sent, verified or not, unless the
+        -- venue closed the court for that time.
         if (old.booking_status = 'CONFIRMED' or old.payment_status = 'AWAITING_VERIFICATION')
-           and now() > old.start_time - make_interval(hours => r.cancellation_cutoff_hours) then
+           and now() > old.start_time - make_interval(hours => r.cancellation_cutoff_hours)
+           and not app.court_is_closed(old.court_id, r.venue_id, old.start_time, old.end_time) then
           raise exception using errcode = '23514',
             message = format('CANCELLATION_CUTOFF: Bookings can only be cancelled up to %s hour(s) before start. Please contact the venue.',
                              r.cancellation_cutoff_hours);
         end if;
+        if new.cancellation_reason = 'PAYMENT_WINDOW_EXPIRED' then
+          new.cancellation_reason := 'CANCELLED_BY_USER';
+        end if;
+      elsif new.cancellation_reason is distinct from old.cancellation_reason then
+        raise exception using errcode = '42501', message = 'A cancellation reason can only be given when cancelling.';
+      end if;
+    end if;
+
+    -- [Step 3] Venue staff: the Step 3 insert rules hold on edits too.
+    if v_manager and not v_trusted then
+      if new.coach_id is distinct from old.coach_id and new.coach_id is not null then
+        raise exception using errcode = '42501', message = 'Coach sessions are booked by the player at checkout.';
+      end if;
+      if (new.walk_in_name is distinct from old.walk_in_name or new.walk_in_phone is distinct from old.walk_in_phone)
+         and (old.walk_in_name is null or new.walk_in_name is null) then
+        raise exception using errcode = '42501', message = 'Only walk-in bookings have walk-in details.';
+      end if;
+      if v_slot_changed then
+        -- Re-price a moved, extended or coach-less booking (discount kept, capped at court + lights).
+        select * into q from public.quote_court_booking(new.court_id, new.start_time, new.end_time, new.coach_id);
+        new.court_amount  := q.court_amount;
+        new.lights_amount := q.lights_amount;
+        new.coach_amount  := q.coach_amount;
+        new.discount_amount := least(old.discount_amount, q.court_amount + q.lights_amount);
+      else
+        new.coach_amount := old.coach_amount;   -- never the coach's fee
+      end if;
+      if new.discount_amount > new.court_amount + new.lights_amount then
+        raise exception using errcode = '23514', message = 'A discount cannot exceed the court and lights amount.';
+      end if;
+      new.total_amount := new.court_amount + new.lights_amount + new.coach_amount - new.discount_amount;
+    end if;
+
+    -- [Step 3] Switching how to pay while nothing has been paid yet (e.g. GCash short, pay by Maya;
+    -- staff record cash handed over at the desk).
+    if new.payment_method is distinct from old.payment_method and not app.is_trusted_context() then
+      if not v_manager then
+        if not (old.booking_status = 'PENDING_PAYMENT' and old.payment_status in ('UNPAID', 'REJECTED'))
+           or (new.payment_method = 'CASH_ON_COURT' and old.payment_status <> 'UNPAID') then
+          raise exception using errcode = '42501',
+            message = 'PAYMENT_LOCKED: The payment method can''t be changed once a payment was sent.';
+        end if;
+        if (new.payment_method = 'CASH_ON_COURT' and not r.accepts_cash_on_court)
+           or (new.payment_method = 'GCASH' and not r.accepts_gcash)
+           or (new.payment_method = 'MAYA' and not r.accepts_maya)
+           or (new.payment_method = 'BANK_TRANSFER' and not r.accepts_bank_transfer) then
+          raise exception using errcode = '23514',
+            message = 'PAYMENT_METHOD_UNAVAILABLE: This venue doesn''t accept that payment method.';
+        end if;
+      end if;
+      if new.payment_method = 'CASH_ON_COURT' then
+        new.payment_due_at := null;
+        if not v_manager and new.booking_status = 'PENDING_PAYMENT' and new.payment_status = 'UNPAID'
+           and r.auto_confirm_cash_bookings then
+          new.booking_status := 'CONFIRMED';
+        end if;
+      elsif old.payment_method = 'CASH_ON_COURT' and new.payment_status in ('UNPAID', 'REJECTED') then
+        new.payment_due_at := now() + make_interval(mins => r.payment_window_minutes);
+        if not v_manager and new.payment_ref_no is null
+           and new.start_time < now() + make_interval(mins => r.payment_window_minutes) then
+          raise exception using errcode = '23514',
+            message = format('PAY_FIRST: This slot starts within %s minutes. Send the payment first, then book with your reference number.',
+                             r.payment_window_minutes);
+        end if;
+      end if;
+    end if;
+
+    -- [Step 3] A refund closes the booking: before play it's cancelled, after play it's completed.
+    if new.payment_status = 'REFUNDED' and old.payment_status <> 'REFUNDED'
+       and new.booking_status in ('PENDING_PAYMENT', 'CONFIRMED') then
+      if now() >= new.end_time then
+        new.booking_status := 'COMPLETED';
+      else
+        new.booking_status      := 'CANCELLED';
+        new.cancellation_reason := coalesce(new.cancellation_reason, 'REFUNDED_BY_VENUE');
       end if;
     end if;
 
@@ -569,12 +753,21 @@ begin
 
     -- [Step 3] Coach rules apply to venue staff too: the coach's time isn't theirs to give away.
     if new.coach_id is not null and not app.is_trusted_context() then
+      if not r.venue_is_verified then
+        raise exception using errcode = '23514',
+          message = 'COACH_UNAVAILABLE: Coaches can only be booked at verified venues.';
+      end if;
       if new.coach_id = new.booked_by then
         raise exception using errcode = '23514', message = 'You cannot book yourself as the coach.';
       end if;
-      if new.start_time < now()
-         or (new.start_time at time zone r.timezone)::date > (now() at time zone r.timezone)::date + r.booking_horizon_days then
-        raise exception using errcode = '23514', message = 'BEYOND_HORIZON: Coach sessions follow the venue''s booking horizon.';
+      -- Only a new start (or a new coach) is judged by the clock: staff may extend a running lesson.
+      if tg_op = 'INSERT' or new.start_time is distinct from old.start_time or new.coach_id is distinct from old.coach_id then
+        if new.start_time < now() then
+          raise exception using errcode = '23514', message = 'SLOT_IN_PAST: A coach session can''t start in the past.';
+        end if;
+        if (new.start_time at time zone r.timezone)::date > (now() at time zone r.timezone)::date + r.booking_horizon_days then
+          raise exception using errcode = '23514', message = 'BEYOND_HORIZON: Coach sessions follow the venue''s booking horizon.';
+        end if;
       end if;
       if not app.is_within_coach_availability(new.coach_id, new.start_time, new.end_time, r.timezone) then
         raise exception using errcode = '23514',
@@ -586,9 +779,17 @@ begin
   -- ===========================================================================
   -- INSERT: initial state, limits and server-side pricing
   -- ===========================================================================
+  -- [Step 3] Clear only dead holds that would collide with THIS booking (court or coach), on a
+  -- reschedule as on a new booking: the grid already shows them as free.
+  if tg_op = 'UPDATE' and v_slot_changed and new.booking_status <> 'CANCELLED' then
+    perform app.expire_overlapping_holds(new.court_id, new.coach_id, new.start_time, new.end_time, new.id);
+  end if;
+
   if tg_op = 'INSERT' then
-    -- [Step 3] Clear only expired holds that would collide with THIS booking (court or coach).
     perform app.expire_overlapping_holds(new.court_id, new.coach_id, new.start_time, new.end_time);
+    -- Player rules (forced price and state, pay-first, hold cap) also cover coached bookings made by
+    -- venue staff: a coach's time is never free to give away.
+    v_player_rules := not v_manager or (new.coach_id is not null and not v_trusted);
 
     if not v_trusted then
       new.payment_verified_at  := null;
@@ -612,34 +813,51 @@ begin
 
     -- [Step 3] Pay first for last-minute e-wallet slots: an unpaid hold that
     -- would only expire after the start lets the court be resold mid-game.
-    if not v_manager and new.payment_method <> 'CASH_ON_COURT' and new.payment_ref_no is null
+    if v_player_rules and new.payment_method <> 'CASH_ON_COURT' and new.payment_ref_no is null
        and new.start_time < now() + make_interval(mins => r.payment_window_minutes) then
       raise exception using errcode = '23514',
         message = format('PAY_FIRST: This slot starts within %s minutes. Send the payment first, then book with your reference number.',
                          r.payment_window_minutes);
     end if;
 
-    -- [Step 3] Hold cap: one player can't squat a venue's courts with unpaid holds.
-    if not v_manager then
+    -- [Step 3] Hold cap: one player can't squat a venue's courts with bookings that aren't settled
+    -- (unpaid holds, payments the venue hasn't checked yet, pay-at-venue bookings). Entries the
+    -- venue made on a player's behalf don't count against the player.
+    if v_player_rules then
       perform pg_advisory_xact_lock(hashtextextended('rackethub:holds:' || new.booked_by::text, 0));
-      select count(*) into v_active_holds
+      select count(*) filter (where b.booking_status = 'PENDING_PAYMENT' and b.payment_status in ('UNPAID', 'REJECTED')
+                                and b.payment_method <> 'CASH_ON_COURT'),
+             count(*) filter (where b.booking_status = 'PENDING_PAYMENT' and b.payment_status = 'AWAITING_VERIFICATION'),
+             count(*) filter (where b.booking_status = 'PENDING_PAYMENT' and b.payment_status = 'UNPAID'
+                                and b.payment_method = 'CASH_ON_COURT'),
+             count(*) filter (where b.booking_status = 'CONFIRMED' and b.payment_status = 'UNPAID')
+        into v_unpaid_holds, v_in_review, v_cash_requests, v_pay_at_venue
         from public.bookings b
        where b.booked_by = new.booked_by
          and b.venue_id = r.venue_id
          and b.end_time > now()
-         and (   (b.booking_status = 'PENDING_PAYMENT'
-                  and not (b.payment_status in ('UNPAID', 'REJECTED') and b.payment_due_at <= now() - app.hold_grace()))
-              or (b.booking_status = 'CONFIRMED' and b.payment_status = 'UNPAID'));
+         and b.created_by is not distinct from b.booked_by
+         and b.booking_status in ('PENDING_PAYMENT', 'CONFIRMED')
+         and not app.hold_is_dead(b.booking_status, b.payment_status, b.payment_due_at);
+      v_active_holds := v_unpaid_holds + v_in_review + v_cash_requests + v_pay_at_venue;
       if v_active_holds >= r.max_active_holds_per_player then
         raise exception using errcode = '23514',
-          message = format('HOLD_LIMIT_REACHED: You already have %s unpaid booking(s) at this venue. Pay or cancel one first.',
-                           v_active_holds);
+          message = format('HOLD_LIMIT_REACHED: You already have %s booking(s) at this venue that aren''t settled yet (%s). %s',
+                           v_active_holds,
+                           concat_ws(', ',
+                             case when v_unpaid_holds > 0 then v_unpaid_holds || ' waiting for your payment' end,
+                             case when v_in_review > 0 then v_in_review || ' with the venue checking your payment' end,
+                             case when v_cash_requests > 0 then v_cash_requests || ' waiting for the venue to confirm' end,
+                             case when v_pay_at_venue > 0 then v_pay_at_venue || ' to pay at the venue' end),
+                           case when v_unpaid_holds > 0 then 'Pay or cancel one first.'
+                                when v_in_review + v_cash_requests > 0 then 'You can book more once the venue confirms.'
+                                else 'You can book more after you play or cancel one.' end);
       end if;
     end if;
 
     select * into q from public.quote_court_booking(new.court_id, new.start_time, new.end_time, new.coach_id);
 
-    if not v_manager then
+    if v_player_rules then
       new.court_amount    := q.court_amount;
       new.lights_amount   := q.lights_amount;
       new.coach_amount    := q.coach_amount;
@@ -909,16 +1127,23 @@ begin
      where b.id = old.booking_id and b.reserved_for_event_id = old.id;
   end if;
 
-  -- Take the new one. The UPDATE row-locks the booking: a concurrent cancel or
-  -- reschedule either waits and then sees the reservation (READ COMMITTED) or
-  -- fails with 40001 (REPEATABLE READ). There's no window for write skew.
+  -- Take the new one. The UPDATE row-locks the booking and re-checks the WHOLE
+  -- link on its latest version: a concurrent cancel or reschedule either waits
+  -- and is then re-evaluated here (READ COMMITTED: a moved or cancelled booking
+  -- no longer matches) or fails with 40001 (REPEATABLE READ). No write skew.
   if v_live_new and (not v_was_live or new.booking_id is distinct from old.booking_id) then
     update public.bookings b set reserved_for_event_id = new.id
      where b.id = new.booking_id
        and b.booking_status = 'CONFIRMED'
-       and b.reserved_for_event_id is null;
+       and b.reserved_for_event_id is null
+       and b.booked_by = new.organizer_id
+       and b.court_id = new.court_id
+       and b.time_range @> tstzrange(new.start_time, new.end_time, '[)');
     if not found and not exists (
-      select 1 from public.bookings b where b.id = new.booking_id and b.reserved_for_event_id = new.id
+      select 1 from public.bookings b
+       where b.id = new.booking_id and b.reserved_for_event_id = new.id
+         and b.booking_status = 'CONFIRMED' and b.court_id = new.court_id
+         and b.time_range @> tstzrange(new.start_time, new.end_time, '[)')
     ) then
       raise exception using errcode = '23514',
         message = 'COURT_BOOKING_UNAVAILABLE: That court booking is no longer confirmed or is already used by another event.';
@@ -927,6 +1152,31 @@ begin
   return null;
 end;
 $$;
+
+-- [Step 3] When the venue cancels a booking a live event is using (typhoon,
+-- maintenance), the event can't happen either: cancel it with the same reason.
+-- (Organisers can't get here: the guard refuses their cancel of a reserved booking.)
+create or replace function app.tg_bookings_release_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if new.booking_status = 'CANCELLED' and old.booking_status <> 'CANCELLED' and old.reserved_for_event_id is not null then
+    update public.events e
+       set status = 'CANCELLED',
+           cancellation_reason = coalesce(nullif(new.cancellation_reason, 'CANCELLED_BY_USER'), 'The venue cancelled the court booking.')
+     where e.id = old.reserved_for_event_id
+       and e.status in ('SCHEDULED', 'IN_PROGRESS');
+  end if;
+  return null;
+end;
+$$;
+
+create trigger bookings_35_release_event
+  after update of booking_status on public.bookings
+  for each row execute function app.tg_bookings_release_event();
 
 create trigger events_30_reserve_booking
   after insert or update of booking_id, status on public.events
@@ -994,17 +1244,18 @@ begin
     return;
   end if;
 
+  -- An event going live over the coach's dead-but-unswept hold must not fail.
+  -- (Bookings already expire overlapping holds in the guard.) Done BEFORE the
+  -- ledger delete: every path locks hold rows first, then ledger rows.
+  if p_kind = 'EVENT' and v_coach is not null then
+    perform app.expire_overlapping_holds(null, v_coach, lower(v_range), upper(v_range));
+  end if;
+
   if v_current.source_id is not null then
     delete from app.coach_commitments c where c.source_kind = p_kind and c.source_id = p_id;
   end if;
   if v_coach is null then
     return;
-  end if;
-
-  -- An event going live over the coach's dead-but-unswept hold must not fail.
-  -- (Bookings already expire overlapping holds in the guard.)
-  if p_kind = 'EVENT' then
-    perform app.expire_overlapping_holds(null, v_coach, lower(v_range), upper(v_range));
   end if;
 
   begin
@@ -1048,10 +1299,15 @@ begin
   end if;
 
   if tg_table_name = 'bookings' then
+    v_event := case when tg_op = 'DELETE' then old.reserved_for_event_id else new.reserved_for_event_id end;
+    -- Same lock order as everywhere else: the event's dead coach holds first.
+    if v_event is not null then
+      perform app.expire_overlapping_holds(null, e.coach_id, e.start_time, e.end_time)
+         from public.events e where e.id = v_event and e.coach_id is not null;
+    end if;
     perform app.sync_coach_commitment('BOOKING', v_id);
     -- The event this booking covers may need its own row back (booking
     -- cancelled or moved by a trusted actor), or no longer need it.
-    v_event := case when tg_op = 'DELETE' then old.reserved_for_event_id else new.reserved_for_event_id end;
     if v_event is not null then
       perform app.sync_coach_commitment('EVENT', v_event);
     end if;
@@ -1168,16 +1424,20 @@ security invoker
 set search_path = ''
 as $$
 declare
-  v_actor  uuid := auth.uid();
-  v_row    public.bookings;
-  v_mine   uuid;
+  v_actor      uuid := auth.uid();
+  v_row        public.bookings;
+  v_mine       uuid;
+  v_constraint text;
 begin
   if v_actor is null then
     raise exception using errcode = '42501', message = 'Sign in to book a court.';
   end if;
-  -- Cash collected at the desk right now: staff only.
+  -- Cash collected at the desk right now: staff only, and never for a coach's time.
   if p_mark_paid and not app.is_venue_manager((select r.venue_id from app.court_booking_rules(p_court_id) r)) then
     raise exception using errcode = '42501', message = 'Only venue staff can mark a booking as paid.';
+  end if;
+  if p_mark_paid and p_coach_id is not null then
+    raise exception using errcode = '42501', message = 'Coach sessions are paid like player bookings, not marked paid at the desk.';
   end if;
 
   -- Fast path for a retry whose first attempt already committed. Twins with the
@@ -1208,6 +1468,7 @@ begin
       returning * into v_row;
       return v_row;
     exception when unique_violation or exclusion_violation then
+      get stacked diagnostics v_constraint = constraint_name;
       -- A concurrent twin with our key committed first: under READ COMMITTED this
       -- fresh statement sees it. Anything else is a genuine conflict and is
       -- re-raised unchanged (constraint name intact for the TS error mapping).
@@ -1216,16 +1477,24 @@ begin
          where b.created_by = v_actor and b.idempotency_key = p_idempotency_key;
       end if;
       if v_row.id is null then
-        -- "Taken" by the caller's own live booking (e.g. a retry with a new key):
-        -- say so, instead of blaming someone else.
-        select b.id into v_mine from public.bookings b
-         where b.court_id = p_court_id and b.booked_by = coalesce(p_booked_by, v_actor)
-           and b.booking_status <> 'CANCELLED'
-           and b.time_range && tstzrange(p_start, p_end, '[)')
-         limit 1;
-        if v_mine is not null then
-          raise exception using errcode = '23P01', hint = v_mine::text,
-            message = 'SLOT_ALREADY_YOURS: You already have this court at that time.';
+        -- The court is "taken" by the caller's own live booking (e.g. a retry with
+        -- a new key): say so, instead of blaming someone else. Only for a player
+        -- booking for themselves, matching is_mine in the busy RPCs: never for
+        -- staff (walk-ins, on-behalf), never a dead hold (the failed INSERT's
+        -- rollback revived it), never for another constraint (reused reference).
+        if v_constraint = 'bookings_no_court_overlap'
+           and p_booked_by is null and p_walk_in_name is null
+           and not app.is_venue_manager((select r.venue_id from app.court_booking_rules(p_court_id) r)) then
+          select b.id into v_mine from public.bookings b
+           where b.court_id = p_court_id and b.booked_by = v_actor and b.walk_in_name is null
+             and b.booking_status <> 'CANCELLED'
+             and not app.hold_is_dead(b.booking_status, b.payment_status, b.payment_due_at)
+             and b.time_range && tstzrange(p_start, p_end, '[)')
+           limit 1;
+          if v_mine is not null then
+            raise exception using errcode = '23P01', hint = v_mine::text,
+              message = 'SLOT_ALREADY_YOURS: You already have this court at that time.';
+          end if;
         end if;
         raise;
       end if;
@@ -1239,6 +1508,26 @@ begin
      or v_row.booked_by <> coalesce(p_booked_by, v_actor) then
     raise exception using errcode = '22023',
       message = 'IDEMPOTENCY_KEY_REUSED: This checkout was already used for a different booking. Start a new checkout.';
+  end if;
+
+  -- The retry carries what the first attempt didn't (the player paid meanwhile
+  -- and pasted the reference; the desk took the cash): apply it, under the same
+  -- guard rules as a separate update, instead of silently dropping it.
+  if p_payment_ref_no is not null and v_row.payment_ref_no is distinct from p_payment_ref_no then
+    if v_row.payment_ref_no is not null then
+      raise exception using errcode = '22023',
+        message = 'IDEMPOTENCY_KEY_REUSED: This checkout already has a different payment reference. Start a new checkout.';
+    end if;
+    if v_row.booking_status = 'PENDING_PAYMENT' and v_row.payment_status in ('UNPAID', 'REJECTED') then
+      update public.bookings b
+         set payment_ref_no = p_payment_ref_no, payment_status = 'AWAITING_VERIFICATION'
+       where b.id = v_row.id
+      returning * into v_row;
+    end if;
+  end if;
+  if p_mark_paid and v_row.booking_status in ('PENDING_PAYMENT', 'CONFIRMED')
+     and v_row.payment_status in ('UNPAID', 'REJECTED') then
+    update public.bookings b set payment_status = 'PAID' where b.id = v_row.id returning * into v_row;
   end if;
   return v_row;
 end;
@@ -1274,6 +1563,9 @@ begin
   if p_to - p_from > interval '31 days' then
     raise exception using errcode = '22023', message = 'Range is limited to 31 days.';
   end if;
+  if (p_venue_id is null) = (p_court_id is null) then
+    raise exception using errcode = '22023', message = 'Give exactly one of venue or court.';
+  end if;
 
   return query
     select b.court_id, b.start_time, b.end_time,
@@ -1285,19 +1577,21 @@ begin
                 then b.payment_due_at + app.hold_grace() end,
            null::text
       from public.bookings b
+      join public.venues v on v.id = b.venue_id
      where (p_court_id is null or b.court_id = p_court_id)
        and (p_venue_id is null or b.venue_id = p_venue_id)
+       and (v.is_active or app.is_venue_manager(v.id) or app.is_platform_admin())
        and b.booking_status <> 'CANCELLED'
        and b.time_range && tstzrange(p_from, p_to, '[)')
-       and not (b.booking_status = 'PENDING_PAYMENT'
-                and b.payment_status in ('UNPAID', 'REJECTED')
-                and b.payment_due_at <= now() - app.hold_grace())
+       and not app.hold_is_dead(b.booking_status, b.payment_status, b.payment_due_at)
     union all
     select c.id, k.starts_at, k.ends_at, 'CLOSED', false, null::uuid, null::timestamptz, k.reason
       from public.court_closures k
       join public.courts c on c.venue_id = k.venue_id and (k.court_id is null or k.court_id = c.id)
+      join public.venues v on v.id = k.venue_id
      where (p_court_id is null or c.id = p_court_id)
        and (p_venue_id is null or k.venue_id = p_venue_id)
+       and (v.is_active or app.is_venue_manager(v.id) or app.is_platform_admin())
        and tstzrange(k.starts_at, k.ends_at, '[)') && tstzrange(p_from, p_to, '[)')
      order by 1, 2;
 end;
@@ -1308,6 +1602,7 @@ returns table (start_time timestamptz, end_time timestamptz, kind text, is_mine 
                held_until timestamptz, reason text)
 language sql
 stable
+strict
 security invoker
 set search_path = ''
 as $$
@@ -1321,6 +1616,7 @@ returns table (court_id uuid, start_time timestamptz, end_time timestamptz, kind
                booking_id uuid, held_until timestamptz, reason text)
 language sql
 stable
+strict
 security invoker
 set search_path = ''
 as $$
@@ -1358,10 +1654,7 @@ begin
       left join public.bookings b on c.source_kind = 'BOOKING' and b.id = c.source_id
      where c.coach_id = p_coach_id
        and c.time_range && tstzrange(p_from, p_to, '[)')
-       and not (b.id is not null
-                and b.booking_status = 'PENDING_PAYMENT'
-                and b.payment_status in ('UNPAID', 'REJECTED')
-                and b.payment_due_at <= now() - app.hold_grace())
+       and not (b.id is not null and app.hold_is_dead(b.booking_status, b.payment_status, b.payment_due_at))
      order by 1;
 end;
 $$;
@@ -1482,7 +1775,9 @@ grant execute on function app.court_booking_rules(uuid) to authenticated, servic
 grant execute on function app.is_within_coach_availability(uuid, timestamptz, timestamptz, text) to authenticated, service_role;
 grant execute on function app.receipt_exists(text) to authenticated, service_role;
 grant execute on function app.booking_link_info(uuid) to authenticated, service_role;
-grant execute on function app.expire_overlapping_holds(uuid, uuid, timestamptz, timestamptz) to authenticated, service_role;
+grant execute on function app.expire_overlapping_holds(uuid, uuid, timestamptz, timestamptz, uuid) to authenticated, service_role;
+grant execute on function app.hold_is_dead(public.booking_status, public.payment_status, timestamptz) to anon, authenticated, service_role;
+grant execute on function app.event_time_range(uuid) to authenticated, service_role;
 grant execute on function app.expire_unpaid_bookings(uuid) to service_role;
 grant execute on function app.hold_grace() to anon, authenticated, service_role;
 grant execute on function app.court_is_closed(uuid, uuid, timestamptz, timestamptz) to authenticated, service_role;
@@ -1492,6 +1787,14 @@ revoke execute on function app.expire_unpaid_bookings(uuid) from authenticated;
 
 -- Coaches confirm their events by updating this one column.
 grant update (coach_confirmed_at) on public.events to authenticated;
+-- Players switch how they pay while unpaid; the desk records cash (the guard decides).
+grant update (payment_method) on public.bookings to authenticated;
+
+-- The booked coach may cancel the session (the guard allows nothing else).
+create policy "bookings: coach cancels own session"
+  on public.bookings for update to authenticated
+  using (coach_id = (select auth.uid()))
+  with check (coach_id = (select auth.uid()));
 -- Staff fix walk-in typos (the guard keeps players out of these columns).
 grant update (walk_in_name, walk_in_phone) on public.bookings to authenticated;
 

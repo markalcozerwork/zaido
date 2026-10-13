@@ -341,7 +341,8 @@ export function buildDaySlots(input: BuildDaySlotsInput): DaySlot[] {
       end: end.toISOString(),
       occupancy: occupancyOf(cell),
       fit,
-      payFirst: start < addMinutes(now, venue.payment_window_minutes),
+      // Staff skip pay-first, except for a coach's time (player rules apply to it).
+      payFirst: (!staff || coach !== undefined) && start < addMinutes(now, venue.payment_window_minutes),
       maxBookableMinutes: maxBookable({ staff, ctx, cells, i, maxLength, now, coach }),
       heldUntil: heldUntilOf(cell),
       myBookingId: cell.mine?.booking_id ?? null,
@@ -392,12 +393,11 @@ function startFit(
     if (start < now) return "SLOT_IN_PAST";
     if (start < addMinutes(now, venue.min_lead_minutes)) return "TOO_SOON";
     if (isBeyondHorizon(start, now, venue.timezone, venue.booking_horizon_days)) return "BEYOND_HORIZON";
-  } else if (
-    coached &&
-    (start < now || isBeyondHorizon(start, now, venue.timezone, venue.booking_horizon_days))
-  ) {
-    // Coach sessions follow the horizon even when staff book them.
-    return "BEYOND_HORIZON";
+  } else if (coached) {
+    // Staff skip the slot rules, but the guard's coach rules still apply, in this order.
+    if (venue.verification_status !== "VERIFIED") return "COACH_UNAVAILABLE";
+    if (start < now) return "SLOT_IN_PAST";
+    if (isBeyondHorizon(start, now, venue.timezone, venue.booking_horizon_days)) return "BEYOND_HORIZON";
   }
   return "OK";
 }
@@ -439,7 +439,13 @@ function slotFit(a: {
     }
     if (overlapping.some((b) => b.kind === "CLOSED")) return "COURT_CLOSED";
   }
-  if (coach && !isWithinCoachWindows(start, end, coach.windows, tz)) return "COACH_UNAVAILABLE";
+  // Coaches are bookable only at verified venues, within their weekly windows.
+  if (
+    coach &&
+    (ctx.venue.verification_status !== "VERIFIED" || !isWithinCoachWindows(start, end, coach.windows, tz))
+  ) {
+    return "COACH_UNAVAILABLE";
+  }
   const bookings = overlapping.filter((b) => b.kind !== "CLOSED");
   if (!staff && bookings.some((b) => b.is_mine)) return "SLOT_ALREADY_YOURS";
   if (bookings.length > 0) return "SLOT_TAKEN";

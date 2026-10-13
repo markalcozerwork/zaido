@@ -10,8 +10,10 @@
  * availability grid predicts (SLOT_TAKEN, PAY_FIRST, VENUE_CLOSED, …), and the
  * UI only offers slots the grid marked OK.
  */
+import { z } from "zod";
 import {
   bookingActionSchema,
+  uuidSchema,
   holdEndsAt,
   staffBookingSchema,
   validate,
@@ -118,11 +120,20 @@ function cancelledReplay(b: BookingRow): DomainError | null {
  * took the slot meanwhile, the player gets SLOT_TAKEN and contacts the venue
  * about the payment.
  */
+export const rebookRequestSchema = z.strictObject({
+  booking_id: uuidSchema,
+  payment_ref_no: z.string().trim().min(6).max(40),
+  idempotency_key: uuidSchema,
+});
+
 export async function rebookExpiredHold(
   client: DbClient,
-  input: { booking_id: string; payment_ref_no: string; idempotency_key: string },
+  rawInput: unknown,
   deps: ServerDeps = {},
 ): Promise<ActionResult<BookingRow>> {
+  const v = validate(rebookRequestSchema, rawInput);
+  if (!v.ok) return v;
+  const input = v.data;
   const now = (deps.now ?? (() => new Date()))();
   const old = await callWithRetry<BookingRow | null>(
     (signal) =>

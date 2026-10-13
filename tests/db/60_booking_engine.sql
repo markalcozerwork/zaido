@@ -93,12 +93,21 @@ select tests.eq((select discount_amount from public.bookings where booked_by = t
 -- Hold cap, late proofs, receipts
 -- -----------------------------------------------------------------------------
 reset role;
-update public.venues set max_active_holds_per_player = 2 where id = '10000000-0000-4000-a000-000000000001';
+update public.venues set max_active_holds_per_player = 1 where id = '10000000-0000-4000-a000-000000000001';
 set role authenticated;
 select tests.login('erin');
+-- The venue's own on-behalf booking for Erin (above) doesn't count against her.
 select id as erin_hold from public.create_booking(:c1, tests.slot(5, '14:00'), tests.slot(5, '15:00'), 'GCASH') \gset
 select tests.throws(format($$ select * from public.create_booking(%L, tests.slot(5, '15:00'), tests.slot(5, '16:00'), 'GCASH') $$, :c1),
-                    '23514', 'HOLD_LIMIT_REACHED once a player holds the venue''s cap (2, incl. the staff booking for Erin)');
+                    '23514', 'HOLD_LIMIT_REACHED once a player holds the venue''s cap of 1');
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000001', tests.slot(5, '15:00'), tests.slot(5, '16:00'), 'GCASH');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'HOLD_LIMIT_REACHED: You already have 1 booking(s) at this venue that aren''t settled yet (1 waiting for your payment). Pay or cancel one first.',
+                   'the hold-cap message says what is pending and what to do');
+end;
+$$;
 reset role;
 update public.venues set max_active_holds_per_player = 10 where id = '10000000-0000-4000-a000-000000000001';
 -- Simulate the payment window passing before the sweeper ran.
@@ -430,7 +439,7 @@ select tests.eq((select count(*) from app.coach_commitments where source_id = :'
 select tests.eq((select reserved_for_event_id from public.bookings where id = :'cov_booking'), null::uuid,
                 'cancelling the event releases its court booking');
 
--- A trusted actor cancelling a covering booking puts the event's own row back.
+-- The venue cancelling a booking a live event uses (typhoon) cancels the event with it.
 set role authenticated;
 select tests.login('olivia');
 select id as cov2 from public.create_booking(:c2, tests.slot(8, '14:00'), tests.slot(8, '16:00'), 'CASH_ON_COURT',
@@ -443,11 +452,17 @@ select tests.login('carlos');
 update public.events set coach_confirmed_at = now() where id = '50000000-0000-4000-a000-000000000082';
 select tests.login('olivia');
 update public.events set status = 'SCHEDULED' where id = '50000000-0000-4000-a000-000000000082';
+select tests.login('mia');
+update public.bookings set booking_status = 'CANCELLED', cancellation_reason = 'Typhoon Signal No. 3' where id = :'cov2';
 reset role;
-update public.bookings set booking_status = 'CANCELLED', cancellation_reason = 'VENUE_CANCELLED' where id = :'cov2';
-select tests.eq((select string_agg(source_kind, ',') from app.coach_commitments
-                  where source_id in (:'cov2', '50000000-0000-4000-a000-000000000082')),
-                'EVENT', 'when its covering booking is cancelled, the live event commits the coach itself');
+select tests.eq((select status::text || ' / ' || cancellation_reason from public.events where id = '50000000-0000-4000-a000-000000000082'),
+                'CANCELLED / Typhoon Signal No. 3',
+                'venue staff can cancel a booking a live event uses; the event is cancelled with the same reason');
+select tests.eq((select count(*) from app.coach_commitments
+                  where source_id in (:'cov2', '50000000-0000-4000-a000-000000000082'))::int,
+                0, 'neither the cancelled booking nor its cancelled event still commits the coach');
+select tests.eq((select reserved_for_event_id from public.bookings where id = :'cov2'), null::uuid,
+                'the event''s reservation of the booking is released');
 
 -- A clash that predates the ledger (no ledger row) must not abort the sweeps.
 alter table public.bookings disable trigger bookings_40_coach_commitments;
@@ -528,3 +543,351 @@ select tests.ok(exists (select 1 from realtime.messages
                              where topic = 'court:' || :c2 || ':slots' and (payload->>'busy')::boolean
                                and (payload->>'end_time')::timestamptz = tests.slot(8, '08:30')),
                 'editing a closure announces the old range free and the new range closed');
+
+-- =============================================================================
+-- Step 3, round 4: fixes from the implementation review
+-- =============================================================================
+reset role;
+
+-- [C2] The proof the venue is checking can't change under it; a receipt can still be attached once.
+set role authenticated;
+select tests.login('alice');
+select id as r_hold from public.create_booking(:owl, tests.slot(15, '10:00'), tests.slot(15, '11:00'), 'GCASH') \gset
+update public.bookings set payment_ref_no = '9200000000001', payment_status = 'AWAITING_VERIFICATION' where id = :'r_hold';
+select tests.throws(format($$ update public.bookings set payment_ref_no = '9200000000002' where id = %L $$, :'r_hold'),
+                    '42501', 'C2: the reference the venue is checking cannot be swapped');
+reset role;
+insert into storage.objects (bucket_id, name)
+values ('payment-receipts', :'r_hold' || '/late.png'), ('payment-receipts', :'r_hold' || '/other.png');
+set role authenticated;
+select tests.login('alice');
+update public.bookings set payment_receipt_url = :'r_hold' || '/late.png' where id = :'r_hold';
+select tests.ok(true, 'C2: a receipt can still be attached while the payment is under review');
+select tests.throws(format($$ update public.bookings set payment_receipt_url = %L where id = %L $$, :'r_hold' || '/other.png', :'r_hold'),
+                    '42501', 'C2: ...but not swapped for another one');
+
+-- [C4] Reschedules clear the dead holds the grid already shows as free (including moving a dead hold itself).
+reset role;
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method, payment_due_at) values
+  ('30000000-0000-4000-a000-000000000101', :owl, tests.uid('bob'), tests.slot(15, '14:00'), tests.slot(15, '15:00'), 'GCASH', now() - interval '10 minutes'),
+  ('30000000-0000-4000-a000-000000000103', :owl, tests.uid('bob'), tests.slot(15, '16:00'), tests.slot(15, '17:00'), 'GCASH', now() - interval '10 minutes');
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method)
+values ('30000000-0000-4000-a000-000000000102', :owl, tests.uid('erin'), tests.slot(15, '12:00'), tests.slot(15, '13:00'), 'CASH_ON_COURT');
+set role authenticated;
+select tests.login('olivia');
+update public.bookings set start_time = tests.slot(15, '14:00'), end_time = tests.slot(15, '15:00')
+ where id = '30000000-0000-4000-a000-000000000102';
+update public.bookings set start_time = tests.slot(15, '16:30'), end_time = tests.slot(15, '17:30')
+ where id = '30000000-0000-4000-a000-000000000103';
+reset role;
+select tests.eq((select booking_status::text || '/' || cancellation_reason from public.bookings where id = '30000000-0000-4000-a000-000000000101'),
+                'CANCELLED/PAYMENT_WINDOW_EXPIRED', 'C4: moving a booking onto a dead hold expires the hold instead of failing SLOT_TAKEN');
+select tests.ok(true, 'C4: staff can move a dead hold onto an overlapping range');
+
+-- [C5][T6] The caller's dead hold never masks the real conflict.
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method, payment_due_at)
+values ('30000000-0000-4000-a000-000000000104', :owl, tests.uid('erin'), tests.slot(15, '18:00'), tests.slot(15, '19:00'), 'GCASH',
+        now() - interval '10 minutes');
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method)
+values ('30000000-0000-4000-a000-000000000105', :owl, tests.uid('bob'), tests.slot(15, '19:00'), tests.slot(15, '20:00'), 'CASH_ON_COURT');
+set role authenticated;
+select tests.login('erin');
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000077', tests.slot(15, '18:00'), tests.slot(15, '20:00'), 'CASH_ON_COURT');
+  perform tests.ok(false, 'C5: expected a conflict');
+exception when exclusion_violation then
+  perform tests.ok(sqlerrm not like 'SLOT_ALREADY_YOURS%' and sqlerrm like '%bookings_no_court_overlap%',
+                   'C5/T6: a slot taken by someone else is SLOT_TAKEN, even over my own dead hold');
+end;
+$$;
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000077', tests.slot(15, '18:00'), tests.slot(15, '19:00'), 'GCASH',
+                                p_payment_ref_no => '9200000000001');
+  perform tests.ok(false, 'C5: expected a duplicate reference');
+exception when unique_violation then
+  perform tests.ok(sqlerrm like '%bookings_payment_ref_unique%', 'C5: a reused reference is reported as such, not as SLOT_ALREADY_YOURS');
+end;
+$$;
+
+-- [T4][P13] Staff never get "yours": walk-ins and on-behalf conflicts are SLOT_TAKEN.
+select tests.login('mia');
+select id as walk1 from public.create_booking(:c1, tests.slot(15, '09:00'), tests.slot(15, '10:00'), 'CASH_ON_COURT',
+                                              p_walk_in_name => 'Mang Jun') \gset
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000001', tests.slot(15, '09:30'), tests.slot(15, '10:30'), 'CASH_ON_COURT',
+                                p_walk_in_name => 'Aling Nena');
+  perform tests.ok(false, 'T4: expected a conflict');
+exception when exclusion_violation then
+  perform tests.ok(sqlerrm not like 'SLOT_ALREADY_YOURS%', 'T4/P13: a second walk-in over the first is SLOT_TAKEN, not "yours"');
+end;
+$$;
+
+-- [T5] A retry of the same checkout that now carries the reference records it.
+select tests.login('alice');
+select id as t5 from public.create_booking(:owl, tests.slot(16, '10:00'), tests.slot(16, '11:00'), 'GCASH',
+                                           p_idempotency_key => 'cccccccc-0000-4000-a000-000000000005') \gset
+select tests.eq((select payment_status::text || '/' || payment_ref_no
+                   from public.create_booking(:owl, tests.slot(16, '10:00'), tests.slot(16, '11:00'), 'GCASH',
+                                              p_idempotency_key => 'cccccccc-0000-4000-a000-000000000005',
+                                              p_payment_ref_no => '9200000000005')),
+                'AWAITING_VERIFICATION/9200000000005', 'T5: the retried checkout applies the newly supplied reference');
+select tests.throws(format($$ select * from public.create_booking(%L, tests.slot(16, '10:00'), tests.slot(16, '11:00'), 'GCASH',
+                                                                 p_idempotency_key => 'cccccccc-0000-4000-a000-000000000005',
+                                                                 p_payment_ref_no => '9200000000006') $$, :owl),
+                    '22023', 'T5: a different reference on the same checkout is refused');
+
+-- [S1][P2] Cash requests a venue confirms by hand stay busy and count against the hold cap.
+reset role;
+insert into public.venues (id, owner_id, name, municipality_code, barangay_code, address, is_open_24h, verification_status,
+                           max_active_holds_per_player, auto_confirm_cash_bookings)
+values ('10000000-0000-4000-a000-000000000088', tests.uid('olivia'), 'Manual Cash Court', '9900100000', '9900100002',
+        '8 Manual Street, Pasig', true, 'VERIFIED', 2, false);
+insert into public.courts (id, venue_id, name, sport, surface_type, hourly_rate)
+values ('20000000-0000-4000-a000-000000000088', '10000000-0000-4000-a000-000000000088', 'Manual 1', 'PICKLEBALL', 'ACRYLIC', 300);
+\set manual '''20000000-0000-4000-a000-000000000088'''
+set role authenticated;
+select tests.login('bob');
+select id as cash_req from public.create_booking(:manual, tests.slot(16, '08:00'), tests.slot(16, '09:00'), 'CASH_ON_COURT') \gset
+select id from public.create_booking(:manual, tests.slot(16, '10:00'), tests.slot(16, '11:00'), 'CASH_ON_COURT') \gset
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000088', tests.slot(16, '12:00'), tests.slot(16, '13:00'), 'CASH_ON_COURT');
+  perform tests.ok(false, 'S1: expected HOLD_LIMIT_REACHED');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'HOLD_LIMIT_REACHED:%(2 waiting for the venue to confirm). You can book more once the venue confirms.',
+                   'S1/P11: unconfirmed cash requests count against the cap, with a message that says why');
+end;
+$$;
+reset role;
+set role anon;
+select tests.logout();
+select tests.eq((select count(*) from public.get_court_busy_slots(:manual, tests.slot(16, '00:00'), tests.slot(17, '00:00'))
+                  where kind = 'HOLD' and held_until is null)::int,
+                2, 'S1: unconfirmed cash requests show as busy (HOLD, no expiry) to everyone');
+
+-- [S2] Busy RPCs need an id, and hidden (inactive) venues stay hidden.
+reset role;
+insert into public.venues (id, owner_id, name, municipality_code, barangay_code, address, is_open_24h, is_active)
+values ('10000000-0000-4000-a000-000000000089', tests.uid('olivia'), 'Hidden Court Club', '9900100000', '9900100002',
+        '9 Hidden Street, Pasig', true, false);
+insert into public.courts (id, venue_id, name, sport, surface_type, hourly_rate)
+values ('20000000-0000-4000-a000-000000000089', '10000000-0000-4000-a000-000000000089', 'Hidden 1', 'PICKLEBALL', 'ACRYLIC', 300);
+insert into public.court_closures (venue_id, starts_at, ends_at, reason, created_by)
+values ('10000000-0000-4000-a000-000000000089', tests.slot(16, '06:00'), tests.slot(16, '08:00'), 'Owner private party', tests.uid('olivia'));
+set role anon;
+select tests.eq((select count(*) from public.get_venue_busy_slots(null, now(), now() + interval '30 days'))::int, 0,
+                'S2: no venue id, no rows (no platform-wide dump)');
+select tests.eq((select count(*) from public.get_court_busy_slots(null, now(), now() + interval '30 days'))::int, 0,
+                'S2: no court id, no rows');
+select tests.eq((select count(*) from public.get_venue_busy_slots('10000000-0000-4000-a000-000000000089',
+                                                                   tests.slot(16, '00:00'), tests.slot(17, '00:00')))::int,
+                0, 'S2: a hidden venue''s closures are not readable through the RPC');
+reset role;
+set role authenticated;
+select tests.login('olivia');
+select tests.eq((select count(*) from public.get_venue_busy_slots('10000000-0000-4000-a000-000000000089',
+                                                                   tests.slot(16, '00:00'), tests.slot(17, '00:00')))::int,
+                1, 'S2: ...but its own staff still see them');
+
+-- [S3] Coaches only at verified venues; never marked paid at the desk; staff-booked coach time follows player rules.
+select tests.login('dave');
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000066', tests.slot(17, '08:00'), tests.slot(17, '09:00'), 'CASH_ON_COURT',
+                                p_coach_id => tests.uid('carlos'), p_mark_paid => true);
+  perform tests.ok(false, 'S3: expected a refusal');
+exception when others then
+  perform tests.ok(sqlstate = '42501', 'S3: a coach session cannot be marked paid at the desk');
+end;
+$$;
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000066', tests.slot(17, '08:00'), tests.slot(17, '09:00'), 'CASH_ON_COURT',
+                                p_coach_id => tests.uid('carlos'));
+  perform tests.ok(false, 'S3: expected a refusal');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'COACH_UNAVAILABLE: Coaches can only be booked at verified venues.%',
+                   'S3: a self-made (unverified) venue cannot book a coach''s time');
+end;
+$$;
+select tests.login('mia');
+select id as staff_coached from public.create_booking(:c2, tests.slot(17, '10:00'), tests.slot(17, '11:00'), 'GCASH',
+                                                      p_coach_id => tests.uid('carlos'), p_discount_amount => 100) \gset
+select tests.eq((select booking_status::text || '/' || payment_status::text || '/' || (payment_due_at is not null)::text
+                        || '/' || discount_amount::text from public.bookings where id = :'staff_coached'),
+                'PENDING_PAYMENT/UNPAID/true/0.00', 'S3: staff-booked coach time is a normal unpaid hold (no comp, no discount)');
+
+-- [S4] Staff edits keep the insert rules.
+select id as s4 from public.create_booking(:c1, tests.slot(17, '12:00'), tests.slot(17, '13:00'), 'CASH_ON_COURT',
+                                           p_booked_by => tests.uid('alice')) \gset
+select tests.throws(format($$ update public.bookings set coach_id = %L where id = %L $$, tests.uid('carlos'), :'s4'),
+                    '42501', 'S4: staff cannot attach a coach to a booking afterwards');
+select tests.throws(format($$ update public.bookings set walk_in_name = 'Someone Else' where id = %L $$, :'s4'),
+                    '42501', 'S4: staff cannot turn a player''s booking into a walk-in');
+select tests.throws(format($$ update public.bookings set discount_amount = 5000 where id = %L $$, :'s4'),
+                    '23514', 'S4: a discount can''t exceed the court and lights amount on edits either');
+select tests.login('alice');
+select id as fee from public.create_booking(:c1, tests.slot(17, '14:00'), tests.slot(17, '15:00'), 'CASH_ON_COURT',
+                                            p_coach_id => tests.uid('carlos')) \gset
+select tests.login('mia');
+update public.bookings set coach_amount = 0, total_amount = court_amount + lights_amount where id = :'fee';
+select tests.ok((select coach_amount > 0 and total_amount = court_amount + lights_amount + coach_amount - discount_amount
+                   from public.bookings where id = :'fee'),
+                'S4: the coach''s fee can''t be edited away');
+
+-- [S5] Player text is bounded; a cancellation reason only comes with a cancel.
+select tests.login('alice');
+select tests.throws(format($$ select * from public.create_booking(%L, tests.slot(17, '16:00'), tests.slot(17, '17:00'), 'CASH_ON_COURT',
+                                                                 p_notes => repeat('x', 501)) $$, :owl),
+                    '23514', 'S5: notes are limited to 500 characters in the database');
+select tests.throws(format($$ update public.bookings set cancellation_reason = 'PAYMENT_WINDOW_EXPIRED' where id = %L $$, :'r_hold'),
+                    '42501', 'S5: a cancellation reason can''t be set without cancelling');
+
+-- [P1] A proof after the sweep cancelled the hold is HOLD_EXPIRED (the rebook path), not FORBIDDEN.
+reset role;
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method, payment_due_at)
+values ('30000000-0000-4000-a000-000000000106', :owl, tests.uid('bob'), tests.slot(16, '14:00'), tests.slot(16, '15:00'), 'GCASH',
+        now() - interval '10 minutes');
+select app.expire_unpaid_bookings();
+set role authenticated;
+select tests.login('bob');
+do $$
+begin
+  update public.bookings set payment_ref_no = '9200000000106', payment_status = 'AWAITING_VERIFICATION'
+   where id = '30000000-0000-4000-a000-000000000106';
+  perform tests.ok(false, 'P1: expected HOLD_EXPIRED');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'HOLD_EXPIRED:%', 'P1: a late proof after the sweep says HOLD_EXPIRED');
+end;
+$$;
+
+-- [P4] Staff may extend a booking an event uses while it still covers the event, not shrink or move it.
+select tests.login('alice');
+select id as ev_bk from public.create_booking(:c2, tests.slot(18, '18:00'), tests.slot(18, '20:00'), 'CASH_ON_COURT') \gset
+insert into public.events (id, venue_id, court_id, booking_id, organizer_id, title, sport, event_type, status,
+                           start_time, end_time, max_participants)
+values ('50000000-0000-4000-a000-000000000090', '10000000-0000-4000-a000-000000000001', :c2, :'ev_bk', tests.uid('alice'),
+        'Thursday open play', 'PICKLEBALL', 'OPEN_PLAY', 'SCHEDULED', tests.slot(18, '18:00'), tests.slot(18, '20:00'), 12);
+select tests.login('mia');
+update public.bookings set end_time = tests.slot(18, '21:00') where id = :'ev_bk';
+select tests.ok(true, 'P4: the venue can extend a booking an event uses');
+select tests.throws(format($$ update public.bookings set court_id = %L where id = %L $$, :c1, :'ev_bk'),
+                    '23514', 'P4: ...but not move it off the event''s court');
+select tests.throws(format($$ update public.bookings set end_time = %L where id = %L $$, tests.slot(18, '19:00'), :'ev_bk'),
+                    '23514', 'P4: ...or shrink it below the event');
+
+-- [P6] A refund closes the booking: cancelled before play, completed after.
+select tests.login('mia');
+select id as refund_bk from public.create_booking(:c1, tests.slot(18, '08:00'), tests.slot(18, '09:00'), 'CASH_ON_COURT',
+                                                  p_booked_by => tests.uid('alice'), p_mark_paid => true) \gset
+update public.bookings set payment_status = 'REFUNDED' where id = :'refund_bk';
+select tests.eq((select booking_status::text || '/' || payment_status::text || '/' || cancellation_reason
+                   from public.bookings where id = :'refund_bk'),
+                'CANCELLED/REFUNDED/REFUNDED_BY_VENUE', 'P6: refunding before play cancels the booking');
+reset role;
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method, payment_status)
+values ('30000000-0000-4000-a000-000000000107', :c1, tests.uid('alice'),
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') - interval '3 hours',
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') - interval '2 hours', 'CASH_ON_COURT', 'PAID');
+select app.complete_finished_bookings();
+set role authenticated;
+select tests.login('mia');
+update public.bookings set payment_status = 'REFUNDED' where id = '30000000-0000-4000-a000-000000000107';
+select tests.eq((select booking_status::text || '/' || payment_status::text from public.bookings
+                  where id = '30000000-0000-4000-a000-000000000107'),
+                'COMPLETED/REFUNDED', 'P6: a refund after play keeps the booking completed');
+
+-- [P7] Staff reschedules re-price the booking.
+select tests.login('alice');
+select id as p7 from public.create_booking(:c2, tests.slot(18, '15:00'), tests.slot(18, '16:00'), 'GCASH') \gset
+select tests.login('mia');
+update public.bookings set end_time = tests.slot(18, '17:30') where id = :'p7';
+select tests.eq((select total_amount from public.bookings where id = :'p7'),
+                (select q.total_amount from public.quote_court_booking(:c2, tests.slot(18, '15:00'), tests.slot(18, '17:30')) q),
+                'P7: extending a booking re-prices it');
+
+-- [P8] A closure stops payments for affected bookings and lifts the cancellation cutoff.
+select tests.login('alice');
+select id as p8 from public.create_booking(:owl, tests.slot(19, '10:00'), tests.slot(19, '11:00'), 'GCASH') \gset
+reset role;
+insert into public.bookings (id, court_id, booked_by, start_time, end_time, payment_method)
+values ('30000000-0000-4000-a000-000000000108', :owl, tests.uid('alice'),
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') + interval '7 hours',
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') + interval '8 hours', 'CASH_ON_COURT');
+set role authenticated;
+select tests.login('olivia');
+insert into public.court_closures (venue_id, starts_at, ends_at, reason)
+values ('10000000-0000-4000-a000-000000000077', tests.slot(19, '00:00'), tests.slot(20, '00:00'), 'Typhoon Signal No. 3'),
+       ('10000000-0000-4000-a000-000000000077', date_bin('30 minutes', now(), timestamptz '2000-01-01') + interval '6 hours',
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') + interval '9 hours', 'Typhoon Signal No. 3');
+select tests.login('alice');
+do $$
+begin
+  update public.bookings set payment_ref_no = '9200000000108', payment_status = 'AWAITING_VERIFICATION'
+   where court_id = '20000000-0000-4000-a000-000000000077' and start_time = tests.slot(19, '10:00') and booked_by = tests.uid('alice');
+  perform tests.ok(false, 'P8: expected COURT_CLOSED');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'COURT_CLOSED:%', 'P8: no payment proofs for a booking on a closed court');
+end;
+$$;
+update public.bookings set booking_status = 'CANCELLED' where id = '30000000-0000-4000-a000-000000000108';
+select tests.ok(true, 'P8: a booking on a closed court can be cancelled inside the venue''s cutoff');
+
+-- [P9] The booked coach can cancel the session, and nothing else.
+select tests.login('alice');
+select id as p9 from public.create_booking(:c2, tests.slot(19, '08:00'), tests.slot(19, '09:00'), 'CASH_ON_COURT',
+                                           p_coach_id => tests.uid('carlos')) \gset
+select tests.login('carlos');
+select tests.throws(format($$ update public.bookings set notes = 'moved' where id = %L $$, :'p9'),
+                    '42501', 'P9: the coach can''t edit the booking');
+update public.bookings set booking_status = 'CANCELLED' where id = :'p9';
+select tests.eq((select booking_status::text || '/' || cancellation_reason from public.bookings where id = :'p9'),
+                'CANCELLED/CANCELLED_BY_COACH', 'P9: the coach can cancel the session');
+
+-- [P10] Switching how to pay while unpaid; staff record cash handed over at the desk.
+select tests.login('alice');
+select id as p10 from public.create_booking(:owl, tests.slot(20, '14:00'), tests.slot(20, '15:00'), 'GCASH') \gset
+select tests.throws(format($$ update public.bookings set payment_method = 'MAYA' where id = %L $$, :'p10'),
+                    '23514', 'P10: only a payment method the venue accepts');
+select tests.throws(format($$ update public.bookings set payment_method = 'MAYA' where id = %L $$, :'r_hold'),
+                    '42501', 'P10: the method is locked once a payment was sent');
+reset role;
+set role authenticated;
+select tests.login('alice');
+update public.bookings set payment_method = 'CASH_ON_COURT' where id = :'p10';
+select tests.eq((select booking_status::text || '/' || payment_method::text || '/' || coalesce(payment_due_at::text, 'none')
+                   from public.bookings where id = :'p10'),
+                'CONFIRMED/CASH_ON_COURT/none', 'P10: switching a GCash hold to cash at an auto-confirm venue confirms it');
+select tests.login('bob');
+select id as p10b from public.create_booking(:owl, tests.slot(20, '16:00'), tests.slot(20, '17:00'), 'GCASH') \gset
+select tests.login('olivia');
+update public.bookings set payment_method = 'CASH_ON_COURT', payment_status = 'PAID' where id = :'p10b';
+select tests.eq((select booking_status::text || '/' || payment_status::text || '/' || payment_method::text
+                   from public.bookings where id = :'p10b'),
+                'CONFIRMED/PAID/CASH_ON_COURT', 'P10: the desk records cash handed over for a GCash hold as cash');
+
+-- [P12] The desk can extend a running coached lesson; a coached start in the past is SLOT_IN_PAST.
+reset role;
+insert into public.bookings (id, court_id, booked_by, coach_id, start_time, end_time, payment_method)
+values ('30000000-0000-4000-a000-000000000109', :c1, tests.uid('erin'), tests.uid('carlos'),
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') - interval '30 minutes',
+        date_bin('30 minutes', now(), timestamptz '2000-01-01') + interval '30 minutes', 'CASH_ON_COURT');
+set role authenticated;
+select tests.login('mia');
+update public.bookings set end_time = end_time + interval '30 minutes' where id = '30000000-0000-4000-a000-000000000109';
+select tests.ok(true, 'P12: extending a lesson that already started is allowed');
+do $$
+begin
+  perform public.create_booking('20000000-0000-4000-a000-000000000002',
+                                date_bin('30 minutes', now(), timestamptz '2000-01-01') - interval '1 hour',
+                                date_bin('30 minutes', now(), timestamptz '2000-01-01'), 'CASH_ON_COURT',
+                                p_coach_id => tests.uid('carlos'));
+  perform tests.ok(false, 'P12: expected SLOT_IN_PAST');
+exception when check_violation then
+  perform tests.ok(sqlerrm like 'SLOT_IN_PAST:%', 'P12: a coached session starting in the past is SLOT_IN_PAST');
+end;
+$$;
+reset role;

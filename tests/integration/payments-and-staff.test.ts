@@ -58,10 +58,11 @@ describe("payments", () => {
     const player = clientAs(playerId);
     const b = await hold(playerId, fx.courtId, day(6), "08:00");
 
+    const ref = gcashRef();
     const submitted = await submitPaymentProof(player, {
       booking_id: b.id,
       payment_method: "GCASH",
-      payment_ref_no: gcashRef(),
+      payment_ref_no: ref,
     });
     expect(submitted.ok && submitted.data.payment_status).toBe("AWAITING_VERIFICATION");
 
@@ -78,35 +79,45 @@ describe("payments", () => {
 
     const owner = clientAs(fx.ownerId);
     const queue = await listVerificationQueue(owner, fx.venueId);
-    expect(queue.ok && queue.data.map((q) => [q.id, q.player?.id, q.court?.name, q.settleOnly])).toEqual([
-      [b.id, playerId, "Court 1", false],
+    expect(queue.ok && queue.data.map((q) => [q.id, q.player?.id, q.court?.name, q.kind])).toEqual([
+      [b.id, playerId, "Court 1", "PROOF"],
     ]);
     // Players can't verify their own payment.
-    expect(await reviewPayment(player, { decision: "APPROVE", booking_id: b.id })).toMatchObject({
+    expect(
+      await reviewPayment(player, { decision: "APPROVE", booking_id: b.id, payment_ref_no: ref }),
+    ).toMatchObject({
       ok: false,
       error: { code: "FORBIDDEN" },
     });
-    const approved = await reviewPayment(owner, { decision: "APPROVE", booking_id: b.id });
+    const approved = await reviewPayment(owner, {
+      decision: "APPROVE",
+      booking_id: b.id,
+      payment_ref_no: ref,
+    });
     expect(approved.ok && [approved.data.booking_status, approved.data.payment_status]).toEqual([
       "CONFIRMED",
       "PAID",
     ]);
     // A retried approval after a lost response is harmless.
-    expect((await reviewPayment(owner, { decision: "APPROVE", booking_id: b.id })).ok).toBe(true);
+    expect(
+      (await reviewPayment(owner, { decision: "APPROVE", booking_id: b.id, payment_ref_no: ref })).ok,
+    ).toBe(true);
   });
 
   it("a rejected proof re-opens the hold with a fresh payment window", async () => {
     const fx = await createVenue();
     const playerId = await createUser("Typo Payer");
     const b = await hold(playerId, fx.courtId, day(6), "10:00");
+    const ref = gcashRef();
     await submitPaymentProof(clientAs(playerId), {
       booking_id: b.id,
       payment_method: "GCASH",
-      payment_ref_no: gcashRef(),
+      payment_ref_no: ref,
     });
     const rejected = await reviewPayment(clientAs(fx.ownerId), {
       decision: "REJECT",
       booking_id: b.id,
+      payment_ref_no: ref,
       reason: "Reference not found in GCash",
     });
     expect(rejected.ok && rejected.data.payment_status).toBe("REJECTED");
@@ -175,7 +186,7 @@ describe("cancellations", () => {
     expect(grid.ok && grid.data.slots.find((s) => sameInstant(s.start, b.start_time))?.fit).toBe("OK");
 
     const queue = await listVerificationQueue(clientAs(fx.ownerId), fx.venueId);
-    expect(queue.ok && queue.data.find((q) => q.id === b.id)?.settleOnly).toBe(true);
+    expect(queue.ok && queue.data.find((q) => q.id === b.id)?.kind).toBe("SETTLE");
   });
 
   it("CANCELLATION_CUTOFF once the payment was sent inside the venue's cutoff", async () => {
@@ -348,7 +359,7 @@ describe("front desk", () => {
       ends_at: zonedTimeToInstant(date, "12:00").toISOString(),
       reason: "Typhoon Signal No. 2",
     });
-    expect(created.ok && created.data.created_by).toBe(fx.ownerId);
+    expect(created.ok && created.data.closure.created_by).toBe(fx.ownerId);
     const playerId = await createUser("Hopeful");
     const player = clientAs(playerId);
     expect(
@@ -368,7 +379,7 @@ describe("front desk", () => {
       }),
     ).toMatchObject({ ok: false, error: { code: "FORBIDDEN" } });
 
-    expect(await deleteClosure(owner, created.ok ? created.data.id : "")).toEqual({
+    expect(await deleteClosure(owner, created.ok ? created.data.closure.id : "")).toEqual({
       ok: true,
       data: { deleted: true },
     });

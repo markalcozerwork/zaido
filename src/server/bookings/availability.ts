@@ -39,7 +39,12 @@ export interface DayAvailability {
 export interface AvailabilityOptions {
   /** "staff" applies the rules the database applies to venue staff (front desk). Decided by the route, never by input. */
   mode?: "player" | "staff";
+  /** The signed-in user (from the session), so a coach isn't offered themselves as a coach. */
+  viewerId?: string;
 }
+
+/** PostgREST's max-rows (Supabase "Max rows", 1000 by default) silently truncates; page below it. */
+export const BUSY_PAGE_SIZE = 500;
 
 /** One court, one venue-local day, for the chosen duration (and coach). */
 export async function getDayAvailability(
@@ -75,7 +80,9 @@ export async function getDayAvailability(
           .retry(false),
       deps.retry,
     ),
-    q.data.coach_id ? loadCoach(client, q.data.coach_id, window, deps) : Promise.resolve(undefined),
+    q.data.coach_id
+      ? loadCoach(client, q.data.coach_id, ctx.data, window, deps, opts)
+      : Promise.resolve(undefined),
   ]);
   if (!busy.ok) return busy;
   if (coach && !coach.ok) return coach;
@@ -121,17 +128,19 @@ export async function getVenueDayAvailability(
 
   const extra = Math.max(...contexts.data.map((c) => fetchExtra(c, q.data.duration_minutes, opts)));
   const window = busyFetchWindow(q.data.date, first.venue.timezone, extra);
-  const busy = await callWithRetry<Array<BusyRange & { court_id: string }>>(
-    (signal) =>
+  // A busy venue can exceed PostgREST's row cap in one day: page until a short page.
+  const busy = await fetchAllPages<BusyRange & { court_id: string }>(
+    (from, to) => (signal) =>
       client
         .rpc("get_venue_busy_slots", {
           p_venue_id: q.data.venue_id,
           p_from: window.from.toISOString(),
           p_to: window.to.toISOString(),
         })
+        .range(from, to)
         .abortSignal(signal)
         .retry(false),
-    deps.retry,
+    deps,
   );
   if (!busy.ok) return busy;
 
@@ -202,18 +211,49 @@ function checkDate(date: string, ctx: CourtBookingContext, now: Date): ActionRes
   return null;
 }
 
+/**
+ * Runs a ranged request page by page (rows from..to inclusive) until a page
+ * comes back short. Ordered RPCs make the pages stable.
+ */
+export async function fetchAllPages<T>(
+  page: (
+    from: number,
+    to: number,
+  ) => (
+    signal: AbortSignal,
+  ) => PromiseLike<{ data: T[] | null; error: { code?: string; message?: string } | null; status: number }>,
+  deps: ServerDeps,
+  pageSize = BUSY_PAGE_SIZE,
+): Promise<ActionResult<T[]>> {
+  const rows: T[] = [];
+  for (let from = 0; ; from += pageSize) {
+    const res = await callWithRetry<T[]>(page(from, from + pageSize - 1), deps.retry);
+    if (!res.ok) return res;
+    const chunk = res.data ?? [];
+    rows.push(...chunk);
+    if (chunk.length < pageSize) return { ok: true, data: rows };
+  }
+}
+
+/**
+ * The coach's rate, weekly windows and existing commitments. Only coaches the
+ * database would price for this court are offered: verified, giving private
+ * sessions, coaching this sport, and not the viewer themselves.
+ */
 async function loadCoach(
   client: DbClient,
   coachId: string,
+  ctx: CourtBookingContext,
   window: { from: Date; to: Date },
   deps: ServerDeps,
+  opts: AvailabilityOptions,
 ): Promise<ActionResult<CoachAvailabilityInput>> {
   const [profile, windows, busy] = await Promise.all([
-    callWithRetry<{ hourly_rate: number } | null>(
+    callWithRetry<{ hourly_rate: number; offers_private: boolean; sports_coached: string[] } | null>(
       (signal) =>
         client
           .from("coach_profiles")
-          .select("hourly_rate")
+          .select("hourly_rate, offers_private, sports_coached")
           .eq("profile_id", coachId)
           .eq("verified_status", "VERIFIED")
           .abortSignal(signal)
@@ -247,7 +287,12 @@ async function loadCoach(
   if (!profile.ok) return profile;
   if (!windows.ok) return windows;
   if (!busy.ok) return busy;
-  if (!profile.data) {
+  if (
+    !profile.data ||
+    !profile.data.offers_private ||
+    !profile.data.sports_coached.includes(ctx.court.sport) ||
+    coachId === opts.viewerId
+  ) {
     return {
       ok: false,
       error: {

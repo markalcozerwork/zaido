@@ -34,7 +34,7 @@ begin
   end if;
 
   -- Booking-engine triggers.
-  foreach t in array array['bookings_guard', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
+  foreach t in array array['bookings_guard', 'bookings_35_release_event', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
                            'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments',
                            'court_closures_stamp', 'court_closures_broadcast'] loop
     if not exists (select 1 from pg_trigger where tgname = t and not tgisinternal and tgenabled <> 'D') then

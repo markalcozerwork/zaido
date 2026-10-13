@@ -5,6 +5,7 @@ import {
   busySlotsQuerySchema,
   canPlayerCancel,
   cancellationTerms,
+  reviewPrecondition,
   checkSlotAgainstCourt,
   holdEndsAt,
   receiptAttachSchema,
@@ -249,6 +250,7 @@ describe("payment submission & review", () => {
 
   it("maps a valid submission to AWAITING_VERIFICATION", () => {
     expect(toPaymentSubmissionUpdate(paymentSubmissionSchema.parse(submission))).toEqual({
+      payment_method: "GCASH",
       payment_ref_no: "1009876543210",
       payment_receipt_url: `${BOOKING}/gcash.jpg`,
       payment_status: "AWAITING_VERIFICATION",
@@ -271,6 +273,7 @@ describe("payment submission & review", () => {
   it("accepts the reference alone; the receipt can be attached later", () => {
     const { receipt_path: _omit, ...refOnly } = submission;
     expect(toPaymentSubmissionUpdate(paymentSubmissionSchema.parse(refOnly))).toEqual({
+      payment_method: "GCASH",
       payment_ref_no: "1009876543210",
       payment_status: "AWAITING_VERIFICATION",
     });
@@ -285,24 +288,60 @@ describe("payment submission & review", () => {
     ).toBe(false);
   });
 
-  it("requires a reason to reject and maps every decision", () => {
-    expect(paymentReviewSchema.safeParse({ decision: "REJECT", booking_id: BOOKING }).success).toBe(false);
+  it("requires a reason to reject, the reviewed reference to decide, and maps every decision", () => {
+    const REF = "1009876543210";
     expect(
-      paymentReviewSchema.safeParse({ decision: "APPROVE", booking_id: BOOKING, reason: "x" }).success,
+      paymentReviewSchema.safeParse({ decision: "REJECT", booking_id: BOOKING, payment_ref_no: REF }).success,
     ).toBe(false);
+    expect(paymentReviewSchema.safeParse({ decision: "APPROVE", booking_id: BOOKING }).success).toBe(false);
     expect(
-      toPaymentReviewUpdate(
-        paymentReviewSchema.parse({ decision: "REJECT", booking_id: BOOKING, reason: "Ref not found" }),
-      ),
-    ).toEqual({
+      paymentReviewSchema.safeParse({
+        decision: "APPROVE",
+        booking_id: BOOKING,
+        payment_ref_no: REF,
+        reason: "x",
+      }).success,
+    ).toBe(false);
+    const reject = paymentReviewSchema.parse({
+      decision: "REJECT",
+      booking_id: BOOKING,
+      payment_ref_no: REF,
+      reason: "Ref not found",
+    });
+    expect(toPaymentReviewUpdate(reject)).toEqual({
       payment_status: "REJECTED",
       payment_rejection_reason: "Ref not found",
     });
-    expect(toPaymentReviewUpdate({ decision: "APPROVE", booking_id: BOOKING })).toEqual({
+    const approve = { decision: "APPROVE", booking_id: BOOKING, payment_ref_no: REF } as const;
+    expect(toPaymentReviewUpdate(approve)).toEqual({ payment_status: "PAID" });
+    expect(toPaymentReviewUpdate({ decision: "MARK_CASH_COLLECTED", booking_id: BOOKING })).toEqual({
+      payment_method: "CASH_ON_COURT",
       payment_status: "PAID",
+    });
+    expect(toPaymentReviewUpdate({ decision: "CONFIRM_CASH_REQUEST", booking_id: BOOKING })).toEqual({
+      booking_status: "CONFIRMED",
     });
     expect(toPaymentReviewUpdate({ decision: "REFUND", booking_id: BOOKING })).toEqual({
       payment_status: "REFUNDED",
+    });
+  });
+
+  it("decisions only apply to the state they were made for (a retry still matches)", () => {
+    const REF = "1009876543210";
+    expect(reviewPrecondition({ decision: "APPROVE", booking_id: BOOKING, payment_ref_no: REF })).toEqual({
+      eq: { payment_ref_no: REF },
+      in: { payment_status: ["AWAITING_VERIFICATION", "PAID"] },
+    });
+    expect(
+      reviewPrecondition({
+        decision: "REJECT",
+        booking_id: BOOKING,
+        payment_ref_no: REF,
+        reason: "Not found",
+      }),
+    ).toEqual({ eq: { payment_ref_no: REF }, in: { payment_status: ["AWAITING_VERIFICATION", "REJECTED"] } });
+    expect(reviewPrecondition({ decision: "REFUND", booking_id: BOOKING }).in).toEqual({
+      payment_status: ["PAID", "REFUNDED"],
     });
   });
 
@@ -399,6 +438,18 @@ describe("describeBooking / canPlayerCancel", () => {
       refundEligible: false,
       cutoffAt: null,
     });
+    expect(cancellationTerms(confirmed, 24, afterCutoff)).toMatchObject({
+      allowed: false,
+      blockedBy: "CUTOFF",
+    });
+    // A booking that holds the court for a live event: cancel the event instead.
+    expect(
+      cancellationTerms(
+        { ...confirmed, reserved_for_event_id: "50000000-0000-4000-a000-000000000001" },
+        24,
+        NOW,
+      ),
+    ).toMatchObject({ allowed: false, blockedBy: "EVENT" });
   });
 
   it("an unpaid hold stays 'awaiting payment' through the grace period", () => {
@@ -413,8 +464,44 @@ describe("describeBooking / canPlayerCancel", () => {
       total_amount: 500,
     };
     expect(describeBooking(hold, new Date("2026-10-13T00:04:59Z")).nextAction).toBe("PAY");
-    expect(describeBooking(hold, new Date("2026-10-13T00:05:00Z")).label).toBe("Payment window closed");
+    expect(describeBooking(hold, new Date("2026-10-13T00:05:00Z"))).toMatchObject({
+      label: "Payment window closed",
+      nextAction: "REBOOK",
+    });
     expect(holdEndsAt(due).toISOString()).toBe("2026-10-13T00:05:00.000Z");
+  });
+
+  it("labels refunds owed and offers a rebook for an expired e-wallet hold", () => {
+    const base = {
+      payment_method: "GCASH" as const,
+      payment_due_at: null,
+      payment_rejection_reason: null,
+      total_amount: 500,
+    };
+    expect(
+      describeBooking({
+        ...base,
+        booking_status: "CANCELLED",
+        payment_status: "PAID",
+        cancellation_reason: "Rain",
+      }),
+    ).toMatchObject({ label: "Cancelled · Refund pending", nextAction: "NONE" });
+    expect(
+      describeBooking({
+        ...base,
+        booking_status: "CANCELLED",
+        payment_status: "UNPAID",
+        cancellation_reason: "PAYMENT_WINDOW_EXPIRED",
+      }),
+    ).toMatchObject({ label: "Expired", nextAction: "REBOOK" });
+    expect(
+      describeBooking({
+        ...base,
+        booking_status: "COMPLETED",
+        payment_status: "REFUNDED",
+        cancellation_reason: null,
+      }),
+    ).toMatchObject({ label: "Completed · Refunded" });
   });
 });
 

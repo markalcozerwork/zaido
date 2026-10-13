@@ -237,6 +237,25 @@ describe("buildDaySlots", () => {
   });
 });
 
+describe("buildDaySlots: rules from the implementation review", () => {
+  const coach = { hourlyRate: 800, windows: [], busy: [] };
+
+  it("coaches are only bookable at verified venues", () => {
+    const unverified = { ...ctx, venue: { ...ctx.venue, verification_status: "UNVERIFIED" as const } };
+    expect(grid({ ctx: unverified, coach }).get("10:00")!.fit).toBe("COACH_UNAVAILABLE");
+    expect(grid({ ctx: unverified, coach, mode: "staff" }).get("10:00")!.fit).toBe("COACH_UNAVAILABLE");
+    expect(grid({ ctx: unverified }).get("10:00")!.fit).toBe("OK");
+  });
+
+  it("staff: no pay-first flag (except for a coach's time); a coached start in the past is SLOT_IN_PAST", () => {
+    const today = grid({ mode: "staff", date: "2026-10-13" });
+    expect(today.get("08:00")!.payFirst).toBe(false);
+    const coached = grid({ mode: "staff", date: "2026-10-13", coach });
+    expect(coached.get("08:00")!.payFirst).toBe(true);
+    expect(coached.get("07:00")!.fit).toBe("SLOT_IN_PAST");
+  });
+});
+
 describe("busyFetchWindow", () => {
   it("covers the local day plus the longest booking that can start on it", () => {
     const w = busyFetchWindow(MONDAY, "Asia/Manila", 240);

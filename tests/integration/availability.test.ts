@@ -191,9 +191,11 @@ describe("grid verdicts ≡ create_booking outcomes", () => {
     const date = day(6);
     const dow = toZonedParts(zonedTimeToInstant(date, "12:00"), MANILA).dayOfWeek;
     const coachId = await createCoach([{ day_of_week: dow, start_time: "06:00", end_time: "12:00" }]);
-    const fx = await createVenue({ venue: { max_active_holds_per_player: 50 } });
+    const fx = await createVenue({
+      venue: { max_active_holds_per_player: 50, verification_status: "VERIFIED" },
+    });
     // The coach is busy 09:00–10:00 with another player at another venue.
-    const elsewhere = await createVenue();
+    const elsewhere = await createVenue({ venue: { verification_status: "VERIFIED" } });
     const res = await createBooking(clientAs(await createUser("Other Student")), {
       court_id: elsewhere.courtId,
       start_time: zonedTimeToInstant(date, "09:00").toISOString(),

@@ -76,7 +76,7 @@ select tests.ok(to_regclass('realtime.messages') is null
 
 select tests.eq(
   (select string_agg(t, ', ') from unnest(array[
-      'bookings_guard', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
+      'bookings_guard', 'bookings_35_release_event', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
       'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments',
       'court_closures_stamp', 'court_closures_broadcast']) as t
     where not exists (select 1 from pg_trigger g where g.tgname = t and not g.tgisinternal)),

@@ -452,7 +452,11 @@ describe("end-to-end booking flow with the schemas", () => {
 
     await db.asAdmin();
     await db.asUser(owner);
-    const review = paymentReviewSchema.parse({ decision: "APPROVE", booking_id: booking.id });
+    const review = paymentReviewSchema.parse({
+      decision: "APPROVE",
+      booking_id: booking.id,
+      payment_ref_no: submission.payment_ref_no,
+    });
     const approved = await tryRun(
       db,
       updateSql("bookings", toPaymentReviewUpdate(review), { id: booking.id }),
@@ -467,6 +471,7 @@ describe("end-to-end booking flow with the schemas", () => {
     const { owner, player } = await setupVenue(db);
     const start = zonedTimeToInstant(nextMonday(), "10:00");
     await db.asUser(player);
+    const firstRef = uniqueGcashRef();
     const { id } = createdRow<Row<"bookings">>(
       await tryRun(
         db,
@@ -478,7 +483,7 @@ describe("end-to-end booking flow with the schemas", () => {
             start_time: start.toISOString(),
             end_time: new Date(start.getTime() + 3_600_000).toISOString(),
             payment_method: "GCASH",
-            payment_ref_no: uniqueGcashRef(),
+            payment_ref_no: firstRef,
           },
           "row_to_json(bookings) as j",
         ),
@@ -490,6 +495,7 @@ describe("end-to-end booking flow with the schemas", () => {
       paymentReviewSchema.parse({
         decision: "REJECT",
         booking_id: id,
+        payment_ref_no: firstRef,
         reason: "Reference not found in GCash",
       }),
     );
