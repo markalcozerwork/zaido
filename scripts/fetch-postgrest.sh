@@ -15,7 +15,18 @@ if [[ -x "$BIN" ]] && "$BIN" --version | grep -q "${VERSION#v}"; then
   exit 0
 fi
 
+# sha256 of the release tarball, so CI never runs a binary that changed upstream.
+declare -A SHA256=(
+  [v13.0.7]=4153f81ccc40e7b735edc89cd84b49da25ba27eb37d57c7f6a82c9005a0b762b
+)
+EXPECTED="${POSTGREST_SHA256:-${SHA256[$VERSION]:-}}"
+[[ -n "$EXPECTED" ]] || { echo "No checksum pinned for PostgREST $VERSION (set POSTGREST_SHA256)." >&2; exit 1; }
+
 mkdir -p "$DEST"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 URL="https://github.com/PostgREST/postgrest/releases/download/${VERSION}/postgrest-${VERSION}-linux-static-x86-64.tar.xz"
-curl -fsSL --retry 4 --retry-delay 2 "$URL" | tar -xJ -C "$DEST"
+curl -fsSL --retry 4 --retry-delay 2 -o "$TMP/postgrest.tar.xz" "$URL"
+echo "$EXPECTED  $TMP/postgrest.tar.xz" | sha256sum -c --quiet -
+tar -xJ -C "$DEST" -f "$TMP/postgrest.tar.xz"
 "$BIN" --version

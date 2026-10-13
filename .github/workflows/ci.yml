@@ -22,9 +22,9 @@ jobs:
       - run: npm test
 
   database:
-    name: Database + contract tests (Postgres ${{ matrix.postgres }})
+    name: Database, contract and integration tests (Postgres ${{ matrix.postgres }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -67,5 +67,13 @@ jobs:
 
       - name: Zod ↔ Postgres contract tests
         run: npm run test:contract
+        env:
+          PGDATABASE: rackethub_test
+
+      - name: Download PostgREST (pinned, checksum-verified)
+        run: npm run postgrest:fetch
+
+      - name: Integration tests (supabase-js → PostgREST 13 → Postgres, real JWTs and RLS)
+        run: npm run test:integration
         env:
           PGDATABASE: rackethub_test
