@@ -22,5 +22,12 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "tests/contract", "vitest.config.ts", "vitest.contract.config.ts"]
+  "include": [
+    "src",
+    "tests/contract",
+    "tests/integration",
+    "vitest.config.ts",
+    "vitest.contract.config.ts",
+    "vitest.integration.config.ts"
+  ]
 }

@@ -16,3 +16,6 @@ supabase/.env
 node_modules/
 coverage/
 *.tsbuildinfo
+
+# Downloaded tools (PostgREST for integration tests)
+.cache/

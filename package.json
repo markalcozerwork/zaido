@@ -12,14 +12,17 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:contract": "vitest run --config vitest.contract.config.ts",
-    "format": "prettier --write src tests/contract \"*.{ts,json}\"",
-    "format:check": "prettier --check src tests/contract \"*.{ts,json}\"",
+    "format": "prettier --write src tests/contract tests/integration \"*.{ts,json}\"",
+    "format:check": "prettier --check src tests/contract tests/integration \"*.{ts,json}\"",
     "db:verify": "scripts/verify-db.sh",
     "db:types": "scripts/gen-db-types.sh",
     "db:types:check": "scripts/gen-db-types.sh --check",
-    "check": "npm run typecheck && npm run format:check && npm test"
+    "check": "npm run typecheck && npm run format:check && npm test",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "postgrest:fetch": "scripts/fetch-postgrest.sh"
   },
   "dependencies": {
+    "@supabase/supabase-js": "2.117.3",
     "zod": "4.6.7"
   },
   "devDependencies": {
