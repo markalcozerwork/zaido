@@ -14,5 +14,6 @@ export * from "./court";
 export * from "./booking";
 export * from "./availability";
 export * from "./realtime";
+export * from "./chat";
 export * from "./errors";
 export * from "./result";

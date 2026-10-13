@@ -30,6 +30,8 @@ export const rotationFormatSchema = z.enum(E.rotation_format);
 export const tournamentFormatSchema = z.enum(E.tournament_format);
 export const queueStateSchema = z.enum(E.queue_state);
 export const channelTypeSchema = z.enum(E.channel_type);
+export const chatReportReasonSchema = z.enum(E.chat_report_reason);
+export const chatReportStatusSchema = z.enum(E.chat_report_status);
 
 export type Sport = DbEnum<"sport">;
 export type SkillLevel = DbEnum<"skill_level">;
@@ -50,6 +52,8 @@ export type RotationFormat = DbEnum<"rotation_format">;
 export type TournamentFormat = DbEnum<"tournament_format">;
 export type QueueState = DbEnum<"queue_state">;
 export type ChannelType = DbEnum<"channel_type">;
+export type ChatReportReason = DbEnum<"chat_report_reason">;
+export type ChatReportStatus = DbEnum<"chat_report_status">;
 
 // -----------------------------------------------------------------------------
 // Labels (English UI copy; i18n can key off the enum values later)
@@ -139,6 +143,22 @@ export const PAYMENT_STATUS_LABELS: Record<PaymentStatus, string> = {
   PAID: "Paid",
   REJECTED: "Payment rejected",
   REFUNDED: "Refunded",
+};
+
+export const CHAT_REPORT_REASON_LABELS: Record<ChatReportReason, string> = {
+  SPAM: "Spam or scam links",
+  HARASSMENT: "Harassment or bullying",
+  HATE: "Hate speech",
+  SEXUAL_CONTENT: "Sexual content",
+  VIOLENCE: "Violence or threats",
+  SCAM: "Fraud or fake payments",
+  OTHER: "Something else",
+};
+
+export const CHAT_REPORT_STATUS_LABELS: Record<ChatReportStatus, string> = {
+  OPEN: "Under review",
+  ACTIONED: "Action taken",
+  DISMISSED: "No action needed",
 };
 
 /** Day-of-week numbering used everywhere: 0 = Sunday … 6 = Saturday (Postgres `extract(dow …)`). */

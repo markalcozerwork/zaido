@@ -17,6 +17,7 @@
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { SLOT_CHANNEL_PRIVATE, SLOT_EVENT, slotChangedPayloadSchema, slotTopic } from "../domain/realtime";
+import { noteChannelClosed, noteChannelOpened } from "./realtime-budget";
 
 export type RealtimeClient = Pick<SupabaseClient, "channel" | "removeChannel">;
 type Channel = ReturnType<RealtimeClient["channel"]>;
@@ -92,6 +93,7 @@ export function subscribeToCourtSlots(
         }
       });
     registry.set(topic, created);
+    noteChannelOpened(client, topic);
     entry = created;
   } else if (entry.subscribed) {
     // Joined before this listener arrived: it still needs its initial fetch.
@@ -111,6 +113,7 @@ export function subscribeToCourtSlots(
     current.listeners.delete(state);
     if (current.listeners.size === 0) {
       registry!.delete(topic);
+      noteChannelClosed(client, topic);
       void client.removeChannel(current.channel);
     }
   };
@@ -153,8 +156,10 @@ export function subscribeToMyBooking(
   onChange: () => void,
   onStatus?: (status: SlotChannelStatus, error?: Error) => void,
 ): () => void {
+  const topic = `booking:${bookingId}:${++bookingChannelSeq}`;
+  noteChannelOpened(client, topic);
   const channel = client
-    .channel(`booking:${bookingId}:${++bookingChannelSeq}`)
+    .channel(topic)
     .on(
       "postgres_changes",
       { event: "UPDATE", schema: "public", table: "bookings", filter: `id=eq.${bookingId}` },
@@ -164,5 +169,8 @@ export function subscribeToMyBooking(
       onStatus?.(status, error);
       if (status === "SUBSCRIBED") onChange();
     });
-  return () => void client.removeChannel(channel);
+  return () => {
+    noteChannelClosed(client, topic);
+    void client.removeChannel(channel);
+  };
 }
