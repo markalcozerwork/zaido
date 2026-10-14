@@ -36,22 +36,36 @@ export async function signChatMedia(
   client: { storage: ChatStorage },
   paths: readonly string[],
 ): Promise<ActionResult<Record<string, string | null>>> {
-  const unique = [...new Set(paths)].filter((p) => CHAT_MEDIA_PATH_PATTERN.test(p)).slice(0, 100);
+  const unique = [...new Set(paths)].filter((p) => CHAT_MEDIA_PATH_PATTERN.test(p));
   const out: Record<string, string | null> = Object.fromEntries(paths.map((p) => [p, null]));
-  if (unique.length === 0) return { ok: true, data: out };
-  const { data, error } = await client.storage
-    .from(CHAT_MEDIA_BUCKET)
-    .createSignedUrls(unique, CHAT_LIMITS.signedUrlSeconds);
-  if (error || !data) {
-    return {
-      ok: false,
-      error: { code: "RETRYABLE", message: "Photos couldn't load. Pull to refresh.", retryable: true },
-    };
-  }
-  for (const item of data) {
-    if (item.path && !item.error && item.signedUrl) out[item.path] = item.signedUrl;
+  // A page holds up to CHAT_LIMITS.pageMax messages; sign them all, in chunks.
+  const results = await Promise.all(
+    chunks(unique, SIGN_CHUNK).map((chunk) =>
+      client.storage.from(CHAT_MEDIA_BUCKET).createSignedUrls(chunk, CHAT_LIMITS.signedUrlSeconds),
+    ),
+  );
+  for (const { data, error } of results) {
+    if (error || !data) {
+      return {
+        ok: false,
+        error: { code: "RETRYABLE", message: "Photos couldn't load. Pull to refresh.", retryable: true },
+      };
+    }
+    for (const item of data) {
+      if (item.path && !item.error && item.signedUrl) out[item.path] = item.signedUrl;
+    }
   }
   return { ok: true, data: out };
+}
+
+const SIGN_CHUNK = 100;
+/** Storage removes at most 1,000 objects per request; stay well below. */
+const REMOVE_CHUNK = 100;
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 export interface PurgeOutcome {
@@ -71,27 +85,36 @@ export async function purgeChatMedia(
   options: { batch?: number } = {},
   deps: ServerDeps = {},
 ): Promise<ActionResult<PurgeOutcome>> {
+  const batch = Math.min(Math.max(options.batch ?? 100, 1), 500);
   const claimed = await callWithRetry<string[]>(
-    (signal) =>
-      service
-        .rpc("claim_chat_media_purge", { p_limit: options.batch ?? 100 })
-        .abortSignal(signal)
-        .retry(false),
+    (signal) => service.rpc("claim_chat_media_purge", { p_limit: batch }).abortSignal(signal).retry(false),
     deps.retry,
   );
   if (!claimed.ok) return claimed;
   const paths = claimed.data;
-  if (paths.length === 0) return { ok: true, data: { claimed: 0, removed: 0, failed: 0 } };
-
-  const { error } = await service.storage.from(CHAT_MEDIA_BUCKET).remove(paths);
-  if (error) return { ok: true, data: { claimed: paths.length, removed: 0, failed: paths.length } };
-
-  // Removing a path that is already gone is not an error, so every claimed
-  // path is now absent.
-  const done = await callWithRetry<number>(
-    (signal) => service.rpc("complete_chat_media_purge", { p_paths: paths }).abortSignal(signal).retry(false),
-    deps.retry,
-  );
-  if (!done.ok) return done;
-  return { ok: true, data: { claimed: paths.length, removed: paths.length, failed: 0 } };
+  let removed = 0;
+  let failed = 0;
+  for (const chunk of chunks(paths, REMOVE_CHUNK)) {
+    const { error } = await service.storage.from(CHAT_MEDIA_BUCKET).remove(chunk);
+    if (error) {
+      failed += chunk.length;
+      continue;
+    }
+    // Removing a path that is already gone is not an error, so every path of
+    // the chunk is now absent: take it off the queue.
+    const done = await callWithRetry<number>(
+      (signal) =>
+        service.rpc("complete_chat_media_purge", { p_paths: chunk }).abortSignal(signal).retry(false),
+      deps.retry,
+    );
+    if (!done.ok) return done;
+    removed += chunk.length;
+  }
+  if (paths.length > 0 && removed === 0) {
+    return {
+      ok: false,
+      error: { code: "RETRYABLE", message: "Storage refused every removal; retry later.", retryable: true },
+    };
+  }
+  return { ok: true, data: { claimed: paths.length, removed, failed } };
 }

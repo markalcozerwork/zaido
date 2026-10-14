@@ -275,3 +275,50 @@ describe("direct messages", () => {
     });
   });
 });
+
+describe("review fixes through PostgREST", () => {
+  it("an ignore-duplicates upsert (ON CONFLICT DO NOTHING) can't burn seqs or bump the inbox", async () => {
+    const ana = await createUser("Ana Lim");
+    const ben = await createUser("Ben Cruz");
+    const channel = await clubChat(ana, ben);
+    const asAna = clientAs(ana);
+    const key = randomUUID();
+    ok(await sendMessage(asAna, { channel_id: channel, client_id: key, text: "real" }));
+    const rows = Array.from({ length: 50 }, () => ({
+      channel_id: channel,
+      client_id: key,
+      message_text: "phantom",
+    }));
+    // seq/rev are trigger-assigned, so the generated Insert type wants them; a
+    // raw client omits them, as here.
+    const { error } = await asAna
+      .from("chat_messages")
+      .upsert(rows as never, { onConflict: "sender_id,client_id", ignoreDuplicates: true });
+    expect(error?.code).toBe("23505");
+    const [row] = ok(await getInbox(clientAs(ben), { channel_ids: [channel] }));
+    expect(row).toMatchObject({ last_seq: 1, unread_count: 1 });
+  });
+
+  it("inbox pages over chats joined in one transaction (same activity time) return every chat once", async () => {
+    const me = await createUser("Bulk Joiner");
+    const owner = await createUser("Club Owner");
+    const channels: string[] = [];
+    for (let i = 0; i < 5; i++) channels.push(await clubChat(owner));
+    // One statement: every membership (and so every chat's join time) shares now().
+    await sql(
+      `insert into public.club_members (club_id, profile_id)
+       select c.club_id, $1 from public.chat_channels c where c.id = any($2::uuid[])`,
+      [me, channels],
+    );
+    const asMe = clientAs(me);
+    const seen: string[] = [];
+    let cursor: { activity_at: string; channel_id: string } | undefined;
+    for (let page = 0; page < 5; page++) {
+      const rows = ok(await getInbox(asMe, { limit: 2, ...(cursor ? { cursor } : {}) }));
+      seen.push(...rows.map((r) => r.channel_id));
+      if (rows.length < 2) break;
+      cursor = { activity_at: rows.at(-1)!.activity_at, channel_id: rows.at(-1)!.channel_id };
+    }
+    expect(seen.sort()).toEqual([...channels].sort());
+  });
+});

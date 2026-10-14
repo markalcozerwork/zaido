@@ -344,7 +344,7 @@ describe("InboxSync", () => {
     await vi.advanceTimersByTimeAsync(1_999);
     expect(calls).toEqual([]);
     await vi.advanceTimersByTimeAsync(2);
-    expect(calls).toEqual([{ channel_ids: [id(1)] }]);
+    expect(calls).toEqual([{ channel_ids: [id(1)], limit: 1 }]);
     expect(sync.entries[0]!.last_message_snippet).toBe("latest");
   });
 
@@ -370,6 +370,205 @@ describe("InboxSync", () => {
     expect(calls).toEqual([]);
     sync.setVisible(true);
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(calls).toEqual([{ channel_ids: [id(1)] }]);
+    expect(calls).toEqual([{ channel_ids: [id(1)], limit: 1 }]);
+  });
+});
+
+describe("review fixes: ConversationSync", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("a send that throws (offline) is retried later, in order, with the same key", async () => {
+    const server = fakeServer();
+    const real = server.api.sendMessage.getMockImplementation()!;
+    let calls = 0;
+    server.api.sendMessage.mockImplementation(async (input) => {
+      if (++calls === 1) throw new TypeError("Failed to fetch");
+      return real(input);
+    });
+    const sync = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      now: () => Date.now(),
+    });
+    await sync.start();
+    const first = sync.send({ text: "hello" });
+    sync.send({ text: "second" });
+    await flush();
+    expect(sync.state.outbox.map((o) => [o.text, o.status])).toEqual([
+      ["hello", "queued"],
+      ["second", "queued"],
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await flush();
+    expect(calls).toBe(3); // the throw, the retry, then "second"
+    expect(server.sends.map((s) => [s.text, s.client_id === first])).toEqual([
+      ["hello", true],
+      ["second", false],
+    ]);
+    expect(sync.state.outbox).toEqual([]);
+  });
+
+  it("a stopped instance never writes the outbox store a newer instance uses", async () => {
+    const store = memoryOutboxStore();
+    const server = fakeServer();
+    let release!: () => void;
+    const real = server.api.sendMessage.getMockImplementation()!;
+    server.api.sendMessage.mockImplementationOnce(async (input) => {
+      await new Promise<void>((r) => (release = r));
+      return real(input);
+    });
+    const a = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      store,
+      newClientId: () => id(801),
+    });
+    await a.start();
+    a.send({ text: "one" });
+    await flush();
+    a.stop();
+    const b = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      store,
+      newClientId: () => id(802),
+    });
+    server.api.sendMessage.mockImplementationOnce(async () => new Promise(() => {})); // b's resend hangs
+    await b.start();
+    b.send({ text: "two" });
+    await flush();
+    release();
+    await flush();
+    expect((await store.load(CH)).map((o) => o.client_id).sort()).toEqual([id(801), id(802)]);
+  });
+
+  it("far behind: a failed reload keeps what is on screen", async () => {
+    const server = fakeServer();
+    server.add("a");
+    const sync = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      maxSyncPages: 1,
+    });
+    await sync.start();
+    for (let i = 0; i < 300; i++) server.add(`x${i}`);
+    const real = server.api.getMessages.getMockImplementation()!;
+    server.api.getMessages.mockImplementation(async (q) =>
+      q.after_rev === undefined
+        ? { ok: false, error: { code: "RETRYABLE", message: "x", retryable: true } }
+        : real(q),
+    );
+    await sync.sync();
+    expect(Object.keys(sync.state.messages).length).toBeGreaterThan(0);
+    expect(sync.state.cursor_rev).not.toBeNull();
+  });
+
+  it("an older page that lands after a reset is dropped instead of leaving a hole", async () => {
+    const server = fakeServer();
+    for (let i = 0; i < 120; i++) server.add(`m${i}`);
+    const sync = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      maxSyncPages: 1,
+      pageSize: 50,
+    });
+    await sync.start();
+    const real = server.api.getMessages.getMockImplementation()!;
+    let releaseOlder!: () => void;
+    server.api.getMessages.mockImplementationOnce(async (q) => {
+      await new Promise<void>((r) => (releaseOlder = r));
+      return real(q);
+    });
+    const older = sync.loadOlder();
+    for (let i = 0; i < 500; i++) server.add(`y${i}`);
+    await sync.sync(); // far behind: reset to the latest page
+    releaseOlder();
+    await older;
+    const seqs = Object.values(sync.state.messages)
+      .map((m) => m.seq)
+      .sort((a, b) => a - b);
+    expect(seqs[seqs.length - 1]! - seqs[0]!).toBe(seqs.length - 1); // contiguous
+  });
+
+  it("reads are reported at least every couple of seconds in a busy chat, and on leaving", async () => {
+    const server = fakeServer();
+    server.add("a");
+    const sync = new ConversationSync(server.api, CH, {
+      onChange: vi.fn(),
+      safetySyncMs: 0,
+      readDebounceMs: 800,
+      readMaxWaitMs: 2_000,
+      now: () => Date.now(),
+    });
+    await sync.start();
+    sync.setVisible(true);
+    for (let i = 0; i < 6; i++) {
+      server.add(`busy ${i}`);
+      await sync.sync();
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    expect(server.reads.length).toBeGreaterThan(0);
+    server.add("last one");
+    await sync.sync();
+    sync.setVisible(false);
+    await flush();
+    expect(server.reads.at(-1)).toBe(8);
+  });
+});
+
+describe("review fixes: InboxSync", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("a short first page is the whole inbox: a chat I left while offline disappears", async () => {
+    let data = [entry(1), entry(2), entry(3)];
+    const api = { getInbox: vi.fn(async (): Promise<ActionResult<InboxEntry[]>> => ({ ok: true, data })) };
+    const sync = new InboxSync(api, { me: ME, onChange: vi.fn(), pollMs: 0, pageSize: 30 });
+    await sync.refresh();
+    data = [entry(2), entry(3)];
+    await sync.refresh();
+    expect(sync.entries.map((e) => e.channel_id).sort()).toEqual([id(2), id(3)]);
+  });
+
+  it("an older refresh response can't bring back unread I already read", async () => {
+    let release!: (r: ActionResult<InboxEntry[]>) => void;
+    const api = {
+      getInbox: vi
+        .fn<(q: InboxQuery) => Promise<ActionResult<InboxEntry[]>>>()
+        .mockResolvedValueOnce({
+          ok: true,
+          data: [entry(1, { last_seq: 8, last_read_seq: 5, unread_count: 3 })],
+        })
+        .mockImplementationOnce(() => new Promise((r) => (release = r))),
+    };
+    const sync = new InboxSync(api, { me: ME, onChange: vi.fn(), pollMs: 0 });
+    await sync.refresh();
+    const second = sync.refresh();
+    sync.onInbox({ channel_id: id(1), reason: "read", last_read_seq: 8 });
+    release({ ok: true, data: [entry(1, { last_seq: 8, last_read_seq: 5, unread_count: 3 })] });
+    await second;
+    expect(sync.entries[0]).toMatchObject({ last_read_seq: 8, unread_count: 0 });
+  });
+
+  it("refetching many stale chats asks for all of them, so none is dropped", async () => {
+    const rows = Array.from({ length: 35 }, (_, i) => entry(i + 1));
+    const api = {
+      getInbox: vi.fn(async (q: InboxQuery): Promise<ActionResult<InboxEntry[]>> => {
+        const pool = q.channel_ids ? rows.filter((e) => q.channel_ids!.includes(e.channel_id)) : rows;
+        return { ok: true, data: pool.slice(0, q.limit ?? 30) };
+      }),
+    };
+    const sync = new InboxSync(api, {
+      me: ME,
+      onChange: vi.fn(),
+      pollMs: 0,
+      pageSize: 50,
+      refetchJitterMs: 0,
+    });
+    await sync.refresh();
+    for (const e of rows) sync.onChannel({ channel_id: e.channel_id, reason: "updated" });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sync.entries).toHaveLength(35);
   });
 });

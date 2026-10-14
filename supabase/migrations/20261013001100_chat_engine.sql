@@ -52,6 +52,13 @@
 --     pass), a replaced organiser/coach leaves the event chat, opening a DM is
 --     invisible to the other person until the first message, and ex-members may
 --     still delete their own messages.
+-- 10. DIRECT INSERTS: users may insert only the message columns (no id, no
+--     sender, no counters), and the guard refuses a reused message key before
+--     the counter moves, so even INSERT ... ON CONFLICT DO NOTHING through
+--     PostgREST can't burn a seq (phantom unread, inbox bumps, DM openings).
+--
+-- 0800 never held production chat data: the backfill below is for development
+-- databases, made safe anyway (duplicate media paths, index-backed markers).
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -97,9 +104,24 @@ update public.chat_channels c
   from (select channel_id, max(seq) as max_seq from public.chat_messages group by channel_id) x
  where x.channel_id = c.id;
 
+-- Uses chat_messages_channel_created_idx (dropped below): one probe per participant.
 update public.chat_participants p
-   set last_read_seq = coalesce((select max(m.seq) from public.chat_messages m
-                                  where m.channel_id = p.channel_id and m.created_at <= p.last_read_at), 0);
+   set last_read_seq = coalesce((select m.seq from public.chat_messages m
+                                  where m.channel_id = p.channel_id and m.created_at <= p.last_read_at
+                                  order by m.created_at desc, m.id desc
+                                  limit 1), 0);
+
+-- 0800 had no media uniqueness: a photo sent twice keeps only its first message's copy.
+with dup as (
+  select m.id, row_number() over (partition by m.media_url order by m.seq, m.id) as n
+    from public.chat_messages m
+   where m.media_url is not null
+)
+update public.chat_messages m
+   set media_url = null, media_kind = null,
+       deleted_at = case when m.message_text is null then coalesce(m.deleted_at, now()) else m.deleted_at end
+  from dup
+ where dup.id = m.id and dup.n > 1;
 
 alter table public.chat_messages     enable trigger user;
 alter table public.chat_participants enable trigger user;
@@ -138,6 +160,14 @@ language sql immutable set search_path = '' as $$ select 20 $$;
 
 create or replace function app.chat_rate_limit_window() returns interval
 language sql immutable set search_path = '' as $$ select interval '30 seconds' $$;
+
+-- An upload must be sent within this time; unsent uploads are swept after
+-- chat_media_orphan_age(). The gap means a send can never race the sweep.
+create or replace function app.chat_media_send_window() returns interval
+language sql immutable set search_path = '' as $$ select interval '20 hours' $$;
+
+create or replace function app.chat_media_orphan_age() returns interval
+language sql immutable set search_path = '' as $$ select interval '1 day' $$;
 
 -- -----------------------------------------------------------------------------
 -- 3. Blocks, reports, media purge queue
@@ -272,25 +302,43 @@ as $$
   select exists (select 1 from public.chat_messages m where m.media_url = p_path and m.deleted_at is null);
 $$;
 
--- The uploaded object's MIME type; NULL when no such object exists.
-create or replace function app.chat_media_mimetype(p_path text)
-returns text
+-- The uploaded object's MIME type and upload time; no row when it doesn't exist.
+create or replace function app.chat_media_object(p_path text, out mimetype text, out uploaded_at timestamptz)
 language plpgsql
 stable
 security definer
 set search_path = ''
 as $$
-declare
-  v_mime text;
 begin
   if to_regclass('storage.objects') is null then
-    return null;
+    return;
   end if;
-  select coalesce(o.metadata ->> 'mimetype', '') into v_mime
+  select coalesce(o.metadata ->> 'mimetype', ''), o.created_at into mimetype, uploaded_at
     from storage.objects o
    where o.bucket_id = 'chat-media' and o.name = p_path;
-  return v_mime;
 end;
+$$;
+
+-- Evidence: an OPEN report holds this object (it can't be deleted or purged).
+create or replace function app.chat_media_in_open_report(p_path text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (select 1 from public.chat_reports r where r.snapshot_media_path = p_path and r.status = 'OPEN');
+$$;
+
+-- Any report points at this object (platform admins may view it).
+create or replace function app.chat_media_is_reported(p_path text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (select 1 from public.chat_reports r where r.snapshot_media_path = p_path);
 $$;
 
 -- Sends by one person in the rate window, and seconds until the oldest of the
@@ -340,17 +388,28 @@ as $$
 declare
   v_trusted  boolean := app.is_trusted_context();
   v_me       uuid := auth.uid();
-  v_mime     text;
+  v_media    record;
   v_rate     record;
   v_nullout  boolean;
 begin
   if tg_op = 'INSERT' then
     if not v_trusted then
+      new.id         := gen_random_uuid();
       new.sender_id  := v_me;
       new.created_at := now();
       new.edited_at  := null;
       new.deleted_at := null;
       new.deleted_by := null;
+      -- A reused message key is refused HERE, before the sequence trigger
+      -- moves the channel counter. (INSERT ... ON CONFLICT DO NOTHING runs
+      -- BEFORE triggers for rows it then skips: without this, each skipped
+      -- row would burn a seq.) Same lock as send_chat_message, which already
+      -- holds it (re-entrant); rows earlier in the same statement are visible.
+      perform pg_advisory_xact_lock(hashtextextended('rackethub:chat-idem:' || v_me::text || ':' || new.client_id::text, 0));
+      if exists (select 1 from public.chat_messages m where m.sender_id = v_me and m.client_id = new.client_id) then
+        raise exception using errcode = '23505', constraint = 'chat_messages_sender_client_key',
+          message = 'This message was already sent.';
+      end if;
       -- Validation before the sequence trigger locks the channel row, so
       -- outsiders and spammers never hold it.
       if v_me is null or not app.is_channel_participant(new.channel_id) then
@@ -386,12 +445,18 @@ begin
           raise exception using errcode = '23514',
             message = 'INVALID_MEDIA: Upload the photo or video for this message first.';
         end if;
-        v_mime := app.chat_media_mimetype(new.media_url);
-        if v_mime is null then
+        select * into v_media from app.chat_media_object(new.media_url);
+        if v_media.uploaded_at is null then
           raise exception using errcode = '23514',
             message = 'INVALID_MEDIA: Upload the photo or video for this message first.';
         end if;
-        new.media_kind := case when v_mime like 'video/%' or new.media_url ~ '\.mp4$' then 'VIDEO' else 'IMAGE' end;
+        -- Old unsent uploads are swept (claim_chat_media_purge); refuse them
+        -- well before that, so a send can't go live as its file is removed.
+        if v_media.uploaded_at < now() - app.chat_media_send_window() then
+          raise exception using errcode = '23514',
+            message = 'MEDIA_EXPIRED: This photo was uploaded too long ago. Attach it again.';
+        end if;
+        new.media_kind := case when v_media.mimetype like 'video/%' or new.media_url ~ '\.mp4$' then 'VIDEO' else 'IMAGE' end;
       else
         new.media_kind := coalesce(new.media_kind,
                                    case when new.media_url ~* '\.mp4$' then 'VIDEO' else 'IMAGE' end);
@@ -1137,7 +1202,8 @@ begin
   with page as materialized (
     select c.id, c.type, c.title, c.club_id, c.event_id, c.dm_profile_low, c.dm_profile_high,
            c.is_archived, c.last_seq, p.is_muted, p.last_read_seq,
-           greatest(coalesce(c.last_message_at, c.created_at), p.joined_at) as activity_at
+           -- Milliseconds: the client's cursor (an ISO instant) round-trips exactly.
+           date_trunc('milliseconds', greatest(coalesce(c.last_message_at, c.created_at), p.joined_at)) as activity_at
       from public.chat_participants p
       join public.chat_channels c on c.id = p.channel_id
      where p.profile_id = v_me
@@ -1145,10 +1211,12 @@ begin
        and (p_channel_ids is not null or c.is_archived = coalesce(p_archived, false))
        and not (c.type = 'DIRECT' and c.last_seq = 0)   -- an unsent DM isn't a conversation yet
        and (p_before_activity is null
-            or (greatest(coalesce(c.last_message_at, c.created_at), p.joined_at), c.id)
+            or (date_trunc('milliseconds', greatest(coalesce(c.last_message_at, c.created_at), p.joined_at)), c.id)
                < (p_before_activity, p_before_channel))
      order by 12 desc, c.id desc
-     limit least(greatest(coalesce(p_limit, 30), 1), 50)
+     -- Specific chats: all of them (at most 50), whatever p_limit says.
+     limit case when p_channel_ids is not null then cardinality(p_channel_ids)
+                else least(greatest(coalesce(p_limit, 30), 1), 50) end
   )
   select pg.id,
          pg.type,
@@ -1407,27 +1475,60 @@ stable
 security definer
 set search_path = ''
 as $$
+declare
+  v_limit  integer := least(greatest(coalesce(p_limit, 100), 1), 1000);
+  v_queued text[];
 begin
-  return query
-  (select q.path
-     from app.chat_media_purge q
-    where not app.chat_media_is_live(q.path)
-      and not exists (select 1 from public.chat_reports r where r.snapshot_media_path = q.path and r.status = 'OPEN')
-    order by q.queued_at
-    limit least(greatest(coalesce(p_limit, 100), 1), 1000));
-  if to_regclass('storage.objects') is not null then
+  select coalesce(array_agg(x.path), '{}') into v_queued from (
+    select q.path
+      from app.chat_media_purge q
+     where not app.chat_media_is_live(q.path)
+       and not app.chat_media_in_open_report(q.path)
+     order by q.queued_at
+     limit v_limit) x;
+  return query select unnest(v_queued);
+  -- Unsent uploads, older than any send may accept (chat_media_send_window <
+  -- chat_media_orphan_age), up to the rest of the batch.
+  if cardinality(v_queued) < v_limit and to_regclass('storage.objects') is not null then
     return query execute $q$
       select o.name
         from storage.objects o
        where o.bucket_id = 'chat-media'
-         and o.created_at < now() - interval '1 day'
+         and o.created_at < now() - app.chat_media_orphan_age()
          and not exists (select 1 from public.chat_messages m where m.media_url = o.name)
          and not exists (select 1 from app.chat_media_purge q where q.path = o.name)
-         and not exists (select 1 from public.chat_reports r where r.snapshot_media_path = o.name and r.status = 'OPEN')
+         and not app.chat_media_in_open_report(o.name)
        order by o.created_at
        limit $1 $q$
-    using least(greatest(coalesce(p_limit, 100), 1), 1000);
+    using v_limit - cardinality(v_queued);
   end if;
+end;
+$$;
+
+-- Platform admins: the moderation queue, with who resolved what (reporters
+-- don't see resolver identities or internal notes).
+create or replace function public.list_chat_reports(
+  p_status          public.chat_report_status default 'OPEN',
+  p_before_created  timestamptz default null,
+  p_before_id       uuid default null,
+  p_limit           integer default 50
+)
+returns setof public.chat_reports
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if not app.is_platform_admin() then
+    raise exception using errcode = '42501', message = 'Only platform admins can review reports.';
+  end if;
+  return query
+  select r.* from public.chat_reports r
+   where (p_status is null or r.status = p_status)
+     and (p_before_created is null or (r.created_at, r.id) < (p_before_created, p_before_id))
+   order by r.created_at desc, r.id desc
+   limit least(greatest(coalesce(p_limit, 50), 1), 200);
 end;
 $$;
 
@@ -1459,8 +1560,12 @@ revoke select on public.chat_participants from authenticated;
 grant select (channel_id, profile_id, joined_at) on public.chat_participants to authenticated;
 grant update (last_read_seq) on public.chat_participants to authenticated;
 
--- Message columns stay as granted in 0900 (message_text, deleted_at). The new
--- ones are server-owned.
+-- Messages: clients supply only the content columns. The id, sender, stamps
+-- and counters are the server's (the guard sets them regardless).
+revoke insert on public.chat_messages from authenticated;
+grant insert (channel_id, client_id, message_text, media_url, reply_to_id, media_width, media_height)
+  on public.chat_messages to authenticated;
+-- Updates stay as granted in 0900 (message_text, deleted_at).
 
 revoke all on public.profile_blocks, public.chat_reports from anon;
 revoke update, truncate, references, trigger on public.profile_blocks from authenticated;
@@ -1469,6 +1574,12 @@ grant insert (blocker_id, blocked_id) on public.profile_blocks to authenticated;
 revoke insert, delete, truncate, references, trigger on public.chat_reports from authenticated;
 revoke update on public.chat_reports from authenticated;
 grant update (status, resolution_note) on public.chat_reports to authenticated;
+-- Reporters see their report and its outcome, not who resolved it or the
+-- moderators' notes (platform admins use list_chat_reports).
+revoke select on public.chat_reports from authenticated;
+grant select (id, reporter_id, message_id, channel_id, reported_profile_id, reason, note,
+              snapshot_text, snapshot_media_path, status, resolved_at, created_at, updated_at)
+  on public.chat_reports to authenticated;
 revoke all on app.chat_media_purge from public, anon, authenticated;
 
 -- Storage: media of deleted messages stops being readable at once; a sent
@@ -1501,7 +1612,14 @@ create policy "chat-media: uploader deletes unsent uploads"
     bucket_id = 'chat-media'
     and (storage.foldername(name))[2] = (select auth.uid())::text
     and not app.chat_media_is_live(name)
+    and not app.chat_media_in_open_report(name)   -- evidence stays until the report is resolved
   );
+
+-- Reported media: platform admins review it, also in DMs (no moderators there)
+-- and after the sender deleted the message.
+create policy "chat-media: platform admins read reported media"
+  on storage.objects for select to authenticated
+  using (bucket_id = 'chat-media' and app.is_platform_admin() and app.chat_media_is_reported(name));
 
 -- -----------------------------------------------------------------------------
 -- 19. Realtime: leave Postgres Changes; topic policies for Broadcast
@@ -1581,7 +1699,11 @@ $$;
 -- Helpers the INVOKER guard, policies and RPCs call as the user.
 grant execute on function app.dm_is_blocked(uuid)        to authenticated, service_role;
 grant execute on function app.chat_media_is_live(text)   to authenticated, service_role;
-grant execute on function app.chat_media_mimetype(text)  to authenticated, service_role;
+grant execute on function app.chat_media_object(text)          to authenticated, service_role;
+grant execute on function app.chat_media_in_open_report(text)  to authenticated, service_role;
+grant execute on function app.chat_media_is_reported(text)     to authenticated, service_role;
+grant execute on function app.chat_media_send_window()         to authenticated, service_role;
+grant execute on function app.chat_media_orphan_age()          to authenticated, service_role;
 grant execute on function app.chat_rate_status(uuid)     to authenticated, service_role;
 grant execute on function app.chat_edit_window()         to authenticated, service_role;
 grant execute on function app.chat_rate_limit_count()    to authenticated, service_role;
@@ -1596,6 +1718,7 @@ revoke all on function public.list_chat_participants(uuid, uuid, integer)       
 revoke all on function public.report_chat_message(uuid, public.chat_report_reason, text)       from public, anon;
 revoke all on function public.claim_chat_media_purge(integer)                                  from public, anon, authenticated;
 revoke all on function public.complete_chat_media_purge(text[])                                from public, anon, authenticated;
+revoke all on function public.list_chat_reports(public.chat_report_status, timestamptz, uuid, integer) from public, anon;
 
 grant execute on function public.send_chat_message(uuid, uuid, text, text, uuid, integer, integer) to authenticated, service_role;
 grant execute on function public.mark_chat_read(uuid, bigint)                                     to authenticated, service_role;
@@ -1606,6 +1729,7 @@ grant execute on function public.list_chat_participants(uuid, uuid, integer)    
 grant execute on function public.report_chat_message(uuid, public.chat_report_reason, text)       to authenticated, service_role;
 grant execute on function public.claim_chat_media_purge(integer)                                  to service_role;
 grant execute on function public.complete_chat_media_purge(text[])                                to service_role;
+grant execute on function public.list_chat_reports(public.chat_report_status, timestamptz, uuid, integer) to authenticated, service_role;
 
 -- Close the PUBLIC execute default on everything this migration defined in app.*
 -- (the explicit grants above are to roles, so they survive).

@@ -327,3 +327,78 @@ describe("edit window", () => {
     expect(canEditMessage({ ...mine, deleted_at: mine.created_at }, ME, new Date(sent))).toBe(false);
   });
 });
+
+describe("review fixes: conversation state", () => {
+  const quoting = (seq: number, quoted: ChatMessage) =>
+    msg(seq, {
+      reply_to: {
+        id: quoted.id,
+        seq: quoted.seq,
+        sender_id: YOU,
+        sender_name: "You There",
+        snippet: quoted.text,
+        media_kind: null,
+        is_deleted: false,
+      },
+    });
+
+  it("a moderated or edited message no longer lives on in the quotes of replies", () => {
+    const abusive = msg(1, { text: "ABUSIVE" });
+    let s = applyLatestPage(initialConversation(CH), page([abusive, quoting(2, abusive)]));
+    s = applySyncPage(
+      s,
+      page([{ ...abusive, rev: 3, text: null, deleted_at: "2026-10-13T10:01:00.000Z" }], { last_rev: 3 }),
+    );
+    expect(s.messages[id(2)]!.reply_to).toMatchObject({ snippet: null, is_deleted: true });
+    s = applySyncPage(s, page([msg(4, { rev: 4 })], { last_seq: 4, last_rev: 4 }));
+    const edited = msg(5, { rev: 5, text: "first version" });
+    s = applySyncPage(s, page([edited, quoting(6, edited)], { last_seq: 6, last_rev: 6 }));
+    s = applySyncPage(s, page([{ ...edited, rev: 7, text: "x".repeat(200) }], { last_seq: 6, last_rev: 7 }));
+    expect(s.messages[id(6)]!.reply_to!.snippet).toBe("x".repeat(140));
+  });
+
+  it("a send result never replaces the synced copy at the same rev (it has no quote or name)", () => {
+    const full = msg(3, { client_id: id(900), sender: { id: ME, name: "Ana Lim", avatar_url: null } });
+    let s = applySyncPage(
+      applyLatestPage(initialConversation(CH), page([])),
+      page([full], { last_seq: 3, last_rev: 3 }),
+    );
+    s = markSent(s, { ...full, sender: { id: ME, name: "", avatar_url: null } });
+    expect(s.messages[full.id]!.sender!.name).toBe("Ana Lim");
+  });
+
+  it("changes to messages above the loaded history aren't shown out of place, but still move the cursor", () => {
+    let s = applyLatestPage(
+      initialConversation(CH),
+      page([msg(251), msg(252)], { last_seq: 252, last_rev: 300, has_more: true }),
+    );
+    s = applySyncPage(
+      s,
+      page([msg(3, { rev: 301, deleted_at: "2026-10-13T10:00:00.000Z" })], { last_seq: 252, last_rev: 301 }),
+    );
+    expect(s.messages[id(3)]).toBeUndefined();
+    expect(s.cursor_rev).toBe(301);
+  });
+
+  it("report notes count characters like the database", async () => {
+    const { reportMessageSchema } = await import("./chat");
+    const base = { message_id: id(1), reason: "HARASSMENT" };
+    expect(reportMessageSchema.safeParse({ ...base, note: "😡".repeat(300) }).success).toBe(true);
+    expect(reportMessageSchema.safeParse({ ...base, note: "a".repeat(501) }).success).toBe(false);
+  });
+});
+
+describe("review fixes: inbox merge", () => {
+  it("fetched rows never move counters backwards", async () => {
+    const { mergeInboxEntry, behindLocal } = await import("./chat");
+    const local = entry({
+      last_seq: 9,
+      last_read_seq: 9,
+      unread_count: 0,
+      activity_at: "2026-10-13T10:00:00.000Z",
+    });
+    const stale = entry({ last_seq: 8, last_read_seq: 5, unread_count: 3 });
+    expect(mergeInboxEntry(local, stale)).toMatchObject({ last_seq: 9, last_read_seq: 9, unread_count: 0 });
+    expect(behindLocal([local], [stale])).toEqual([CH]);
+  });
+});

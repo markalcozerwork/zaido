@@ -26,6 +26,8 @@
 #  13. 40 parallel sends by one person across 4 chats → exactly the rate limit
 #  14. two devices moving one read marker at once → the highest wins
 #  15. both people opening their DM at once → one thread
+#  16. senders, editors and deleters racing while a member syncs by rev through
+#      get_chat_messages → the member ends with every change, at its final rev
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -471,12 +473,15 @@ limit=$(qa -c "select app.chat_rate_limit_count()")
   || { for i in $(seq 1 40); do sed 's/^/    /' "$WORK/spam.$i.out"; done | sort | uniq -c | head; fail "rate limit race: ok=$okcalls limited=$limited (limit $limit)"; }
 echo "  ok - 40 parallel sends across 4 chats by one person: exactly $limit accepted, $limited RATE_LIMITED"
 
-# 14. Two devices of racer 2 move the club read marker to different positions at once.
+# 14. Two devices of racer 2 move the club read marker to different positions at
+# once. The highest position goes first and the lower ones race in after it, so a
+# last-writer-wins regression would always end below the maximum.
 GO="$(start_at)"
 for i in $(seq 1 12); do
+  target=$(( (i * 7) % 17 )); delay=$([[ $target -eq 16 ]] && echo 0 || echo 0.2)
   ( set +e
-    q -c "set role authenticated" -c "select tests.login('$(racer 2)'::uuid)" -c "$(barrier "$GO")" \
-      -c "select public.mark_chat_read('$CHAT', $(( (i * 7) % 17 )))" >"$WORK/mark.$i.out" 2>&1 ) &
+    q -c "set role authenticated" -c "select tests.login('$(racer 2)'::uuid)" -c "$(barrier "$GO")" -c "select pg_sleep($delay)" \
+      -c "select public.mark_chat_read('$CHAT', $target)" >"$WORK/mark.$i.out" 2>&1 ) &
 done
 wait
 marker=$(qa -c "select last_read_seq from public.chat_participants where channel_id = '$CHAT' and profile_id = '$(racer 2)'")
@@ -501,3 +506,73 @@ threads=$(qa -c "select count(*) from public.chat_channels where type = 'DIRECT'
                    and dm_profile_high = greatest('$(racer 18)'::uuid, '$(racer 19)'::uuid)")
 [[ "$ids" -eq 1 && "$threads" -eq 1 ]] || { sed 's/^/    /' "$WORK"/dm.1.out; fail "DM open race: ids=$ids threads=$threads"; }
 echo "  ok - $N simultaneous DM opens by both people: one thread, one id"
+
+# 16. Racers 3-10 send, racers 11-16 edit their race-11 message (holding the row
+# for a moment), racers 1-2 delete theirs, while racer 20 syncs by rev through
+# get_chat_messages under RLS, the way the app does.
+START_REV=$(qa -c "select last_rev from public.chat_channels where id = '$CHAT'")
+GO="$(start_at)"
+( set +e
+  q >"$WORK/revpoll.out" 2>&1 <<SQL
+set role authenticated;
+select tests.login('$(racer 20)'::uuid);
+$(barrier "$GO");
+create temp table seen (id uuid primary key, rev bigint, body text, deleted boolean);
+do \$\$
+declare
+  v_cursor bigint := $START_REV;
+  v_page   jsonb;
+  v_end    timestamptz := clock_timestamp() + interval '2.5 seconds';
+  v_more   boolean;
+  m        jsonb;
+begin
+  loop
+    loop
+      v_page := public.get_chat_messages('$CHAT', p_after_rev => v_cursor, p_limit => 3);
+      for m in select * from jsonb_array_elements(v_page -> 'messages') loop
+        insert into seen values ((m ->> 'id')::uuid, (m ->> 'rev')::bigint, m ->> 'text', m ->> 'deleted_at' is not null)
+        on conflict (id) do update set rev = excluded.rev, body = excluded.body, deleted = excluded.deleted
+          where seen.rev < excluded.rev;
+        v_cursor := greatest(v_cursor, (m ->> 'rev')::bigint);
+      end loop;
+      v_more := (v_page ->> 'has_more')::boolean;
+      if not v_more then
+        v_cursor := greatest(v_cursor, (v_page ->> 'last_rev')::bigint);
+        exit;
+      end if;
+    end loop;
+    exit when clock_timestamp() > v_end;
+    perform pg_sleep(0.01);
+  end loop;
+end;
+\$\$;
+reset role;
+select 'MISSED ' || count(*) from public.chat_messages c left join seen s on s.id = c.id
+ where c.channel_id = '$CHAT' and c.rev > $START_REV
+   and (s.id is null or s.rev <> c.rev or s.body is distinct from c.message_text or s.deleted <> (c.deleted_at is not null));
+SQL
+) &
+for i in $(seq 3 10); do
+  ( set +e
+    q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" -c "select pg_sleep(0.$(( i % 5 )))" \
+      -c "select seq from public.send_chat_message('$CHAT', gen_random_uuid(), 'race 16 from $i')" >"$WORK/r16s.$i.out" 2>&1 ) &
+done
+for i in $(seq 11 16); do
+  ( set +e
+    q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" -c "begin" \
+      -c "update public.chat_messages set message_text = 'edited by $i' where channel_id = '$CHAT' and sender_id = '$(racer "$i")' and seq <= 16" \
+      -c "select pg_sleep(0.3)" -c "commit" >"$WORK/r16e.$i.out" 2>&1 ) &
+done
+for i in 1 2; do
+  ( set +e
+    q -c "set role authenticated" -c "select tests.login('$(racer "$i")'::uuid)" -c "$(barrier "$GO")" -c "select pg_sleep(0.2)" \
+      -c "update public.chat_messages set deleted_at = now() where channel_id = '$CHAT' and sender_id = '$(racer "$i")' and seq <= 16" \
+      >"$WORK/r16d.$i.out" 2>&1 ) &
+done
+wait
+changed=$(qa -c "select count(*) from public.chat_messages where channel_id = '$CHAT' and rev > $START_REV")
+revs=$(qa -c "select (max(rev) = (select last_rev from public.chat_channels where id = '$CHAT'))::text from public.chat_messages where channel_id = '$CHAT'")
+missed=$(grep -E '^ *MISSED ' "$WORK/revpoll.out" | sed 's/[^0-9]//g' || true)
+[[ "$changed" -eq 16 && "$revs" == "true" && "${missed:-x}" == "0" ]] \
+  || { sed 's/^/    /' "$WORK/revpoll.out" "$WORK"/r16e.11.out | head -20; fail "rev sync race: changed=$changed max_rev_ok=$revs missed=${missed:-?}"; }
+echo "  ok - 8 sends, 6 slow edits and 2 deletes raced a member syncing by rev: all 16 changes seen at their final rev"

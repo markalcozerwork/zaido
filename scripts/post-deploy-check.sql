@@ -67,6 +67,19 @@ begin
     missing := array_append(missing, 'chat_channels.last_seq = max(chat_messages.seq) for every channel');
   end if;
 
+  -- Chat media purge (supabase/functions/purge-chat-media, scheduled): a backlog
+  -- older than two days means the job isn't running.
+  if exists (select 1 from app.chat_media_purge where queued_at < now() - interval '2 days') then
+    missing := array_append(missing, 'a running chat media purge job (queue has entries older than 2 days)');
+  end if;
+  if to_regclass('storage.objects') is not null and exists (
+       select 1 from storage.objects o
+        where o.bucket_id = 'chat-media' and o.created_at < now() - interval '2 days'
+          and not exists (select 1 from public.chat_messages m where m.media_url = o.name)
+          and not app.chat_media_in_open_report(o.name)) then
+    missing := array_append(missing, 'a running chat media purge job (unsent uploads older than 2 days)');
+  end if;
+
   -- Booking-engine triggers.
   foreach t in array array['bookings_guard', 'bookings_35_release_event', 'bookings_40_coach_commitments', 'bookings_50_broadcast_slots',
                            'events_guard', 'events_30_reserve_booking', 'events_40_coach_commitments',

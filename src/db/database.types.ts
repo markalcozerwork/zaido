@@ -1963,6 +1963,37 @@ export type Database = {
           role: string;
         }[];
       };
+      list_chat_reports: {
+        Args: {
+          p_before_created?: string;
+          p_before_id?: string;
+          p_limit?: number;
+          p_status?: Database["public"]["Enums"]["chat_report_status"];
+        };
+        Returns: {
+          channel_id: string | null;
+          created_at: string;
+          id: string;
+          message_id: string | null;
+          note: string | null;
+          reason: Database["public"]["Enums"]["chat_report_reason"];
+          reported_profile_id: string | null;
+          reporter_id: string | null;
+          resolution_note: string | null;
+          resolved_at: string | null;
+          resolved_by: string | null;
+          snapshot_media_path: string | null;
+          snapshot_text: string | null;
+          status: Database["public"]["Enums"]["chat_report_status"];
+          updated_at: string;
+        }[];
+        SetofOptions: {
+          from: "*";
+          to: "chat_reports";
+          isOneToOne: false;
+          isSetofReturn: true;
+        };
+      };
       mark_chat_read: {
         Args: { p_channel_id: string; p_up_to_seq: number };
         Returns: {

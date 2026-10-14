@@ -116,13 +116,29 @@ select tests.eq((select last_seq from public.chat_channels where id = :'dm'), 0:
 select tests.ok(tests.error_of(format($$ insert into public.chat_messages (channel_id, client_id, message_text)
                                          values (%L, 'c0000000-0000-4000-a000-000000000001', 'dup') $$, :'club'))
                   like '23505 %', 'a direct duplicate insert fails on the key');
-select tests.eq((select last_seq from public.chat_channels where id = :'club'), 3::bigint,
-                '…and its counter bump rolled back with it');
+-- PostgREST's resolution=ignore-duplicates is INSERT ... ON CONFLICT DO NOTHING:
+-- BEFORE triggers run for rows it then skips, so the key check must come first.
+select tests.ok(tests.error_of(format($$ insert into public.chat_messages (channel_id, client_id, message_text)
+                                         select %L, 'c0000000-0000-4000-a000-000000000001', 'x' from generate_series(1, 50)
+                                         on conflict (sender_id, client_id) do nothing $$, :'club'))
+                  like '23505 %', 'ON CONFLICT DO NOTHING with a used key is refused, not silently skipped');
+select tests.ok(tests.error_of(format($$ insert into public.chat_messages (channel_id, client_id, message_text)
+                                         select %L, 'c0000000-0000-4000-a000-0000000000ff', 'x' from generate_series(1, 5)
+                                         on conflict do nothing $$, :'club'))
+                  like '23505 %', '…also when the key repeats within one statement');
+select tests.eq((select last_seq || '/' || last_rev from public.chat_channels where id = :'club'), '3/3',
+                '…so no seq or rev was burnt (no phantom unread)');
 select tests.ok(tests.error_of(format($$ select public.send_chat_message(%L, gen_random_uuid(), E' \n ') $$, :'club'))
                   like '23514 MESSAGE_EMPTY:%', 'blank messages are refused');
-select tests.ok(tests.error_of(format($$ insert into public.chat_messages (channel_id, sender_id, message_text, seq, rev)
-                                         values (%L, %L, 'spoof', 99, 99) $$, :'club', :'ben')) is null,
-                'a direct insert with spoofed sender and counters goes through…');
+select tests.throws(format($$ insert into public.chat_messages (channel_id, sender_id, message_text, seq, rev)
+                              values (%L, %L, 'spoof', 99, 99) $$, :'club', :'ben'),
+                    '42501', 'a direct insert can''t set the sender or the counters');
+select tests.throws(format($$ insert into public.chat_messages (id, channel_id, message_text) values (%L, %L, 'spoof') $$,
+                           :'m1', :'club'),
+                    '42501', '…or the id');
+select tests.ok(tests.error_of(format($$ insert into public.chat_messages (channel_id, message_text) values (%L, 'spoof') $$,
+                                      :'club')) is null,
+                'a direct content-only insert goes through…');
 select tests.eq((select sender_id::text || ' ' || seq || '/' || rev from public.chat_messages where message_text = 'spoof'),
                 :'ana' || ' 4/4', '…as the caller, with server-assigned seq/rev');
 
@@ -252,6 +268,22 @@ select tests.login(:'ana'::uuid);
 insert into public.club_members (club_id, profile_id) values ('40000000-0000-4000-a000-000000000071', :'ana');
 select tests.eq((select channel_id from public.get_chat_inbox(1)), :'quiet'::uuid,
                 'a just-joined quiet chat sorts first');
+select tests.eq((select count(*) from public.get_chat_inbox(1, null, null, false, array[:'club'::uuid, :'quiet'::uuid]))::int, 2,
+                'asking for specific chats returns all of them, whatever p_limit says');
+-- Two chats whose activity falls in the same millisecond (bulk joins share one now()).
+reset role;
+update public.chat_participants set joined_at = '2026-10-01 10:00:00.123456+00'
+ where profile_id = :'ana' and channel_id in (:'quiet', :'club');
+update public.chat_channels set last_message_at = '2026-10-01 10:00:00.123001+00', created_at = '2026-09-01'
+ where id in (:'quiet', :'club');
+update public.chat_channels set last_message_at = '2026-09-15', created_at = '2026-09-01' where id = :'dm';
+update public.chat_participants set joined_at = '2026-09-15' where profile_id = :'ana' and channel_id = :'dm';
+set role authenticated;
+select tests.login(:'ana'::uuid);
+select activity_at::text as act1, channel_id as cur1 from public.get_chat_inbox(1) \gset
+select tests.eq(:'act1'::text, '2026-10-01 10:00:00.123+00', 'activity is reported in milliseconds (what the client''s cursor holds)');
+select tests.eq((select count(*) from public.get_chat_inbox(1, :'act1', :'cur1'))::int, 1,
+                'the millisecond cursor finds the next chat with the same activity');
 
 -- -----------------------------------------------------------------------------
 -- 5. Opening a DM is private until the first message
@@ -384,12 +416,71 @@ select tests.login(:'dan'::uuid);
 select tests.throws(format($$ select public.report_chat_message(%L, 'SPAM') $$, :'m1'), '42501',
                     'only people who can see a message can report it');
 select tests.login(:'adi'::uuid);
+select tests.eq((select count(*) from public.list_chat_reports() where id = :'rep')::int, 1,
+                'platform admins see the open report in their queue');
 update public.chat_reports set status = 'ACTIONED', resolution_note = 'Warned' where id = :'rep';
-select tests.eq((select (resolved_by = :'adi'::uuid)::text || ' ' || (resolved_at is not null) from public.chat_reports where id = :'rep'),
-                'true true', 'platform admins resolve reports (stamped)');
+select tests.eq((select (resolved_by = :'adi'::uuid)::text || ' ' || (resolved_at is not null) || ' ' || resolution_note
+                   from public.list_chat_reports('ACTIONED') where id = :'rep'),
+                'true true Warned', 'platform admins resolve reports (stamped)');
 select tests.login(:'ben'::uuid);
 select tests.eq(tests.affected(format($$ update public.chat_reports set status = 'DISMISSED' where id = %L $$, :'rep')),
                 0::bigint, 'reporters can''t resolve their own reports');
+select tests.eq((select status::text || ' ' || (resolved_at is not null) from public.chat_reports where id = :'rep'),
+                'ACTIONED true', 'reporters see the outcome…');
+select tests.throws($$ select resolved_by from public.chat_reports $$, '42501', '…but not who resolved it (admins stay hidden)');
+select tests.throws($$ select resolution_note from public.chat_reports $$, '42501', '…or the moderators'' notes');
+select tests.throws($$ select * from public.list_chat_reports() $$, '42501', 'only platform admins get the queue');
+
+-- -----------------------------------------------------------------------------
+-- 9b. Reported media is evidence; uploads expire before the sweep takes them
+-- -----------------------------------------------------------------------------
+select tests.login(:'ana'::uuid);
+\set evid_key 'c0000000-0000-4000-a000-000000000311'
+select :'club' || '/' || :'ana' || '/' || :'evid_key' || '.png' as evid \gset
+insert into storage.objects (bucket_id, name, owner, metadata) values ('chat-media', :'evid', :'ana', '{"mimetype": "image/png"}');
+select id as evid_msg from public.send_chat_message(:'club', :'evid_key', null, :'evid') \gset
+select tests.login(:'ben'::uuid);
+select public.report_chat_message(:'evid_msg', 'SEXUAL_CONTENT') as evid_rep \gset
+select tests.login(:'ana'::uuid);
+update public.chat_messages set deleted_at = now() where id = :'evid_msg';
+select tests.eq(tests.affected(format($$ delete from storage.objects where name = %L $$, :'evid')), 0::bigint,
+                'a sender can''t destroy media held by an open report');
+select tests.login(:'adi'::uuid);
+select tests.eq((select count(*) from storage.objects where name = :'evid')::int, 1,
+                'platform admins can open reported media (even deleted, even in a DM)');
+select tests.login(:'dan'::uuid);
+select tests.eq((select count(*) from storage.objects where name = :'evid')::int, 0, '…nobody else can');
+reset role;
+select tests.ok(not (:'evid' in (select public.claim_chat_media_purge(1000))), 'the purge job keeps it while the report is open');
+update public.chat_reports set status = 'DISMISSED' where id = :'evid_rep';
+select tests.ok(:'evid' in (select public.claim_chat_media_purge(1000)), '…and claims it once the report is resolved');
+
+-- Unsent uploads: refused for sending after 20 h, swept after a day, never while referenced.
+\set old_key 'c0000000-0000-4000-a000-000000000321'
+select :'club' || '/' || :'ana' || '/' || :'old_key' || '.jpg' as old_obj,
+       :'club' || '/' || :'ana' || '/c0000000-0000-4000-a000-000000000322.jpg' as fresh_obj \gset
+insert into storage.objects (bucket_id, name, owner, metadata, created_at) values
+  ('chat-media', :'old_obj', :'ana', '{"mimetype": "image/jpeg"}', now() - interval '21 hours'),
+  ('chat-media', :'fresh_obj', :'ana', '{"mimetype": "image/jpeg"}', now() - interval '2 hours');
+set role authenticated;
+select tests.login(:'ana'::uuid);
+select tests.ok(tests.error_of(format($$ select public.send_chat_message(%L, %L, null, %L) $$, :'club', :'old_key', :'old_obj'))
+                  like '23514 MEDIA_EXPIRED:%', 'an upload older than the send window must be attached again');
+reset role;
+select tests.ok(not (:'old_obj' in (select public.claim_chat_media_purge(1000))), 'a 21-hour-old upload is not swept yet');
+update storage.objects set created_at = now() - interval '25 hours' where name = :'old_obj';
+select tests.ok(:'old_obj' in (select public.claim_chat_media_purge(1000))
+                and not (:'fresh_obj' in (select public.claim_chat_media_purge(1000))),
+                'unsent uploads older than a day are swept; recent ones are not');
+set role authenticated;
+select tests.login(:'ana'::uuid);
+select public.send_chat_message(:'club', 'c0000000-0000-4000-a000-000000000322', null, :'fresh_obj');
+reset role;
+update storage.objects set created_at = now() - interval '25 hours' where name = :'fresh_obj';
+select tests.ok(not (:'fresh_obj' in (select public.claim_chat_media_purge(1000))),
+                'media of a live message is never claimed, however old');
+select tests.eq((select count(*) from public.claim_chat_media_purge(1))::int, 1, 'the batch size caps queue + sweep together');
+set role authenticated;
 
 -- -----------------------------------------------------------------------------
 -- 10. Message pages and sync

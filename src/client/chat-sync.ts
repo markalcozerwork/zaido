@@ -17,6 +17,7 @@ import {
   applyOlderPage,
   applyReadToInbox,
   applySyncPage,
+  behindLocal,
   discardOutboxItem,
   enqueueMessage,
   initialConversation,
@@ -58,9 +59,28 @@ const realTimers: Required<Pick<Timers, "setTimer" | "clearTimer">> = {
   clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
 };
 
+const OFFLINE = {
+  code: "RETRYABLE",
+  message: "You're offline. We'll keep trying.",
+  retryable: true,
+} as const;
+
+/** Run an API call; a throw (network) becomes a retryable error result. */
+async function safely<T>(call: () => Promise<ActionResult<T>>): Promise<ActionResult<T>> {
+  try {
+    return await call();
+  } catch {
+    return { ok: false, error: { ...OFFLINE } };
+  }
+}
+
 // -----------------------------------------------------------------------------
 // One conversation
 // -----------------------------------------------------------------------------
+/**
+ * The server actions as the app calls them. They may also throw (a fetch that
+ * fails offline); the engines treat that like a retryable error.
+ */
 export interface ConversationApi {
   getMessages(query: MessagesQuery): Promise<ActionResult<MessagesPage>>;
   sendMessage(input: SendMessageInput): Promise<ActionResult<ChatMessage>>;
@@ -91,6 +111,8 @@ export interface ConversationOptions extends Timers {
   /** Catch-up even without hints (lost broadcasts, sleeping sockets). */
   safetySyncMs?: number;
   readDebounceMs?: number;
+  /** A read is reported at least this often while messages keep arriving. */
+  readMaxWaitMs?: number;
   /** Sync pages per catch-up before falling back to reloading the latest page. */
   maxSyncPages?: number;
   pageSize?: number;
@@ -108,8 +130,11 @@ export class ConversationSync {
   private stopped = false;
   private wakeTimer: unknown;
   private readTimer: unknown;
+  private readPendingSince: number | undefined;
   private safetyTimer: unknown;
   private visible = false;
+  /** Bumped when the state is rebuilt from scratch; older in-flight pages are dropped. */
+  private generation = 0;
 
   constructor(
     private readonly api: ConversationApi,
@@ -124,14 +149,14 @@ export class ConversationSync {
   }
 
   private set(next: ConversationState) {
-    if (next === this.state) return;
+    if (next === this.state || this.stopped) return;
     this.state = next;
     this.opts.onChange(next);
   }
 
   /** Restore the outbox, load the latest page, resume sending. */
   async start(): Promise<ActionResult<void>> {
-    const saved = await this.store.load(this.state.channel_id);
+    const saved = await this.store.load(this.state.channel_id).catch(() => [] as OutboxItem[]);
     let s = this.state;
     for (const item of saved) {
       const { status: _s, attempts: _a, channel_id: _c, ...rest } = item;
@@ -144,7 +169,14 @@ export class ConversationSync {
     return res;
   }
 
+  /**
+   * Leave the screen. Reports what was read, cancels timers, and makes any
+   * request still in flight a no-op (it must not overwrite the outbox store
+   * that a newer instance for this chat may already use).
+   */
   stop() {
+    if (this.stopped) return;
+    this.flushRead();
     this.stopped = true;
     this.clearTimer(this.wakeTimer);
     this.clearTimer(this.readTimer);
@@ -152,11 +184,12 @@ export class ConversationSync {
   }
 
   private async loadLatest(): Promise<ActionResult<void>> {
-    const res = await this.api.getMessages({
-      channel_id: this.state.channel_id,
-      limit: this.opts.pageSize ?? 50,
-    });
-    if (!res.ok) return res;
+    const gen = this.generation;
+    const res = await safely(() =>
+      this.api.getMessages({ channel_id: this.state.channel_id, limit: this.opts.pageSize ?? 50 }),
+    );
+    if (!res.ok || this.stopped || gen !== this.generation)
+      return res.ok ? { ok: true, data: undefined } : res;
     this.set(applyLatestPage(this.state, res.data));
     this.maybeMarkRead();
     return { ok: true, data: undefined };
@@ -189,25 +222,39 @@ export class ConversationSync {
     }
     for (let i = 0; i < (this.opts.maxSyncPages ?? 5); i++) {
       if (this.stopped) return;
-      const res = await this.api.getMessages({
-        channel_id: this.state.channel_id,
-        after_rev: this.state.cursor_rev ?? 0,
-        limit: 200,
-      });
-      if (!res.ok) return; // the next hint, resync or safety timer tries again
+      const res = await safely(() =>
+        this.api.getMessages({
+          channel_id: this.state.channel_id,
+          after_rev: this.state.cursor_rev ?? 0,
+          limit: 200,
+        }),
+      );
+      if (!res.ok || this.stopped) return; // the next hint, resync or safety timer tries again
       this.set(applySyncPage(this.state, res.data));
       if (!res.data.has_more) {
         this.maybeMarkRead();
         return;
       }
     }
-    // Far behind (long offline): the latest page is cheaper than replaying every change.
-    this.set({
-      ...initialConversation(this.state.channel_id),
-      outbox: this.state.outbox,
-      read_marker: this.state.read_marker,
-    });
-    await this.loadLatest();
+    // Far behind (long offline): the latest page is cheaper than replaying
+    // every change. Fetch it first and swap only on success, so the screen
+    // never goes blank; pages already in flight for the old state are dropped.
+    const res = await safely(() =>
+      this.api.getMessages({ channel_id: this.state.channel_id, limit: this.opts.pageSize ?? 50 }),
+    );
+    if (!res.ok || this.stopped) return;
+    this.generation++;
+    this.set(
+      applyLatestPage(
+        {
+          ...initialConversation(this.state.channel_id),
+          outbox: this.state.outbox,
+          read_marker: this.state.read_marker,
+        },
+        res.data,
+      ),
+    );
+    this.maybeMarkRead();
   }
 
   /** Realtime hints for this conversation. */
@@ -216,13 +263,21 @@ export class ConversationSync {
   }
 
   async loadOlder(): Promise<ActionResult<void>> {
-    if (!this.state.has_older || this.state.oldest_seq === null) return { ok: true, data: undefined };
-    const res = await this.api.getMessages({
-      channel_id: this.state.channel_id,
-      before_seq: this.state.oldest_seq,
-      limit: this.opts.pageSize ?? 50,
-    });
+    const before = this.state.oldest_seq;
+    if (!this.state.has_older || before === null) return { ok: true, data: undefined };
+    const gen = this.generation;
+    const res = await safely(() =>
+      this.api.getMessages({
+        channel_id: this.state.channel_id,
+        before_seq: before,
+        limit: this.opts.pageSize ?? 50,
+      }),
+    );
     if (!res.ok) return res;
+    // The state was rebuilt, or another page already moved the edge: this
+    // page would leave a hole.
+    if (this.stopped || gen !== this.generation || this.state.oldest_seq !== before)
+      return { ok: true, data: undefined };
     this.set(applyOlderPage(this.state, res.data));
     return { ok: true, data: undefined };
   }
@@ -265,8 +320,14 @@ export class ConversationSync {
     void this.persist().then(() => this.pump());
   }
 
-  private persist() {
-    return this.store.save(this.state.channel_id, this.state.outbox);
+  /** Never rejects; a stopped instance never writes (a newer one may own the store). */
+  private async persist(): Promise<void> {
+    if (this.stopped) return;
+    try {
+      await this.store.save(this.state.channel_id, this.state.outbox);
+    } catch {
+      // Storage full or unavailable: keep sending from memory.
+    }
   }
 
   /** Send queued messages one at a time, in order. */
@@ -279,15 +340,18 @@ export class ConversationSync {
         if (!item || this.stopped) break;
         this.set(markSending(this.state, item.client_id));
         await this.persist();
-        const res = await this.api.sendMessage({
-          channel_id: item.channel_id,
-          client_id: item.client_id,
-          ...(item.text !== undefined ? { text: item.text } : {}),
-          ...(item.media_path !== undefined ? { media_path: item.media_path } : {}),
-          ...(item.media_width !== undefined ? { media_width: item.media_width } : {}),
-          ...(item.media_height !== undefined ? { media_height: item.media_height } : {}),
-          ...(item.reply_to_id !== undefined ? { reply_to_id: item.reply_to_id } : {}),
-        });
+        const res = await safely(() =>
+          this.api.sendMessage({
+            channel_id: item.channel_id,
+            client_id: item.client_id,
+            ...(item.text !== undefined ? { text: item.text } : {}),
+            ...(item.media_path !== undefined ? { media_path: item.media_path } : {}),
+            ...(item.media_width !== undefined ? { media_width: item.media_width } : {}),
+            ...(item.media_height !== undefined ? { media_height: item.media_height } : {}),
+            ...(item.reply_to_id !== undefined ? { reply_to_id: item.reply_to_id } : {}),
+          }),
+        );
+        if (this.stopped) return;
         this.set(
           res.ok
             ? markSent(this.state, res.data)
@@ -309,6 +373,7 @@ export class ConversationSync {
   // Read marker -------------------------------------------------------------------
   /** The conversation is on screen (scrolled to the bottom): report what was seen. */
   setVisible(visible: boolean) {
+    if (!visible) this.flushRead();
     this.visible = visible;
     if (visible) {
       void this.sync();
@@ -316,15 +381,36 @@ export class ConversationSync {
     }
   }
 
+  /**
+   * Debounced, but reported at least every readMaxWaitMs while messages keep
+   * arriving, and never for messages that arrive after the screen is hidden.
+   */
   private maybeMarkRead() {
     if (!this.visible || !needsReadUpdate(this.state) || this.stopped) return;
+    const now = this.now();
+    this.readPendingSince ??= now;
     this.clearTimer(this.readTimer);
-    this.readTimer = this.setTimer(async () => {
-      const target = readTarget(this.state);
-      if (target <= this.state.read_marker) return;
-      const res = await this.api.markRead({ channel_id: this.state.channel_id, up_to_seq: target });
-      if (res.ok) this.set(acknowledgeRead(this.state, res.data.last_read_seq));
-    }, this.opts.readDebounceMs ?? 800);
+    const overdue = now - this.readPendingSince >= (this.opts.readMaxWaitMs ?? 2_000);
+    this.readTimer = this.setTimer(
+      () => {
+        if (this.visible) this.flushRead();
+      },
+      overdue ? 0 : (this.opts.readDebounceMs ?? 800),
+    );
+  }
+
+  /** Report what is on screen now (the screen is about to hide, or the timer fired). */
+  private flushRead() {
+    this.clearTimer(this.readTimer);
+    this.readPendingSince = undefined;
+    if (!this.visible || this.stopped) return;
+    const target = readTarget(this.state);
+    if (target <= this.state.read_marker) return;
+    void safely(() => this.api.markRead({ channel_id: this.state.channel_id, up_to_seq: target })).then(
+      (res) => {
+        if (res.ok) this.set(acknowledgeRead(this.state, res.data.last_read_seq));
+      },
+    );
   }
 }
 
@@ -356,10 +442,13 @@ export class InboxSync {
   private readonly random: () => number;
   private stale = new Set<string>();
   private refetchTimer: unknown;
+  private refetching = false;
   private pollTimer: unknown;
   private visible = true;
   private stopped = false;
   private hasMore = false;
+  private refreshing: Promise<ActionResult<void>> | null = null;
+  private refreshAgain = false;
 
   constructor(
     private readonly api: InboxApi,
@@ -370,33 +459,76 @@ export class InboxSync {
     this.random = opts.random ?? Math.random;
   }
 
+  private get pageSize() {
+    return this.opts.pageSize ?? 30;
+  }
+
   private set(entries: InboxEntry[]) {
+    if (this.stopped) return;
     this.entries = entries;
     this.opts.onChange(entries);
   }
 
-  /** First page from scratch: on start, (re)join, foreground, joined/left, poll. */
-  async refresh(): Promise<ActionResult<void>> {
-    const res = await this.api.getInbox({ limit: this.opts.pageSize ?? 30 });
-    if (!res.ok) return res;
-    // Keep older pages the user scrolled to; replace the first page.
+  private publishTopics() {
+    this.opts.onGroupTopics?.(rankGroupTopics(this.entries, this.opts.maxGroupTopics ?? 20));
+  }
+
+  /**
+   * First page from scratch: on start, (re)join, foreground, joined/left,
+   * poll. Single-flight: calls during a refresh collapse into one more run,
+   * so responses can't land out of order.
+   */
+  refresh(): Promise<ActionResult<void>> {
+    if (this.refreshing) {
+      this.refreshAgain = true;
+      return this.refreshing;
+    }
+    this.refreshing = (async () => {
+      let res: ActionResult<void>;
+      do {
+        this.refreshAgain = false;
+        res = await this.refreshOnce();
+      } while (this.refreshAgain && !this.stopped);
+      return res;
+    })().finally(() => {
+      this.refreshing = null;
+    });
+    return this.refreshing;
+  }
+
+  private async refreshOnce(): Promise<ActionResult<void>> {
+    const res = await safely(() => this.api.getInbox({ limit: this.pageSize }));
+    if (!res.ok || this.stopped) return res.ok ? { ok: true, data: undefined } : res;
     const firstIds = new Set(res.data.map((e) => e.channel_id));
     const last = res.data.at(-1);
-    const older = last
-      ? this.entries.filter((e) => !firstIds.has(e.channel_id) && e.activity_at < last.activity_at)
-      : [];
-    this.hasMore = res.data.length >= (this.opts.pageSize ?? 30);
-    this.set(upsertInbox(older, res.data));
-    this.opts.onGroupTopics?.(rankGroupTopics(this.entries, this.opts.maxGroupTopics ?? 20));
+    let older: InboxEntry[] = [];
+    if (res.data.length >= this.pageSize && last) {
+      // A full page: keep the older pages the user scrolled to, but check
+      // them again (a chat I was removed from while offline must go).
+      older = this.entries.filter((e) => !firstIds.has(e.channel_id) && e.activity_at < last.activity_at);
+      this.markStale(older.map((e) => e.channel_id));
+    }
+    // A short page is the whole inbox: anything else is gone. Rows on the page
+    // merge with what hints already told us (counters only move forward).
+    this.hasMore = res.data.length >= this.pageSize;
+    this.markStale(behindLocal(this.entries, res.data));
+    const keep = new Set([...firstIds, ...older.map((e) => e.channel_id)]);
+    this.set(
+      upsertInbox(
+        this.entries.filter((e) => keep.has(e.channel_id)),
+        res.data,
+      ),
+    );
+    this.publishTopics();
     return { ok: true, data: undefined };
   }
 
   async loadMore(): Promise<ActionResult<boolean>> {
     const cursor = nextInboxCursor(this.entries);
     if (!this.hasMore || !cursor) return { ok: true, data: false };
-    const res = await this.api.getInbox({ limit: this.opts.pageSize ?? 30, cursor });
+    const res = await safely(() => this.api.getInbox({ limit: this.pageSize, cursor }));
     if (!res.ok) return res;
-    this.hasMore = res.data.length >= (this.opts.pageSize ?? 30);
+    this.hasMore = res.data.length >= this.pageSize;
     this.set(upsertInbox(this.entries, res.data));
     return { ok: true, data: this.hasMore };
   }
@@ -428,6 +560,7 @@ export class InboxSync {
     switch (hint.reason) {
       case "left":
         this.set(removeFromInbox(this.entries, hint.channel_id));
+        this.publishTopics();
         break;
       case "read":
         if (hint.last_read_seq !== undefined)
@@ -439,13 +572,20 @@ export class InboxSync {
   }
 
   onChannel(hint: ChannelHint) {
-    if (hint.reason === "deleted") this.set(removeFromInbox(this.entries, hint.channel_id));
-    else this.markStale([hint.channel_id]);
+    if (hint.reason === "deleted") {
+      this.set(removeFromInbox(this.entries, hint.channel_id));
+      this.publishTopics();
+    } else this.markStale([hint.channel_id]);
   }
 
-  /** My user topic (re)joined, or a group topic was lost: start over. */
+  /** My user topic (re)joined: start over. */
   onResync() {
     void this.refresh();
+  }
+
+  /** A group topic was refused (probably removed): check just that chat. */
+  onTopicLost(channelId: string) {
+    this.markStale([channelId]);
   }
 
   // Narrow refetches ------------------------------------------------------------
@@ -456,7 +596,7 @@ export class InboxSync {
   }
 
   private scheduleRefetch(baseMs: number) {
-    if (this.refetchTimer !== undefined || this.stopped) return;
+    if (this.refetchTimer !== undefined || this.refetching || this.stopped) return;
     const delay = baseMs + this.random() * (this.opts.refetchJitterMs ?? 2_000);
     this.refetchTimer = this.setTimer(() => {
       this.refetchTimer = undefined;
@@ -468,17 +608,23 @@ export class InboxSync {
     const ids = [...this.stale].slice(0, 50);
     if (!ids.length || this.stopped) return;
     for (const id of ids) this.stale.delete(id);
-    const res = await this.api.getInbox({ channel_ids: ids });
+    this.refetching = true;
+    const res = await safely(() => this.api.getInbox({ channel_ids: ids, limit: ids.length }));
+    this.refetching = false;
+    if (this.stopped) return;
     if (!res.ok) {
       for (const id of ids) this.stale.add(id);
-      return;
+    } else {
+      const found = new Set(res.data.map((e) => e.channel_id));
+      // Asked for but not returned: I'm no longer in it (or it's an unsent DM).
+      const gone = ids.filter((id) => !found.has(id));
+      let next = this.entries.filter((e) => !gone.includes(e.channel_id));
+      this.markStale(behindLocal(next, res.data));
+      next = upsertInbox(next, res.data);
+      this.set(next);
+      if (gone.length) this.publishTopics();
     }
-    const found = new Set(res.data.map((e) => e.channel_id));
-    // Asked for but not returned: I'm no longer in it (or it's an unsent DM).
-    let next = this.entries.filter((e) => !ids.includes(e.channel_id) || found.has(e.channel_id));
-    next = upsertInbox(next, res.data);
-    this.set(next);
-    if (this.stale.size) this.scheduleRefetch(this.opts.refetchDelayMs ?? 1_500);
+    if (this.stale.size && this.visible) this.scheduleRefetch(this.opts.refetchDelayMs ?? 1_500);
   }
 
   private schedulePoll() {

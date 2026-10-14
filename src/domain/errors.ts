@@ -62,6 +62,7 @@ export const GUARD_CODES = {
   RATE_LIMITED: "text",
   MESSAGE_EMPTY: "text",
   INVALID_MEDIA: "media_path",
+  MEDIA_EXPIRED: "media_path",
   REPLY_NOT_IN_CHANNEL: "reply_to_id",
   MESSAGE_DELETED: undefined,
   EDIT_WINDOW_PASSED: "text",

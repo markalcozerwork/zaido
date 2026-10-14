@@ -16,10 +16,13 @@ select tests.eq(public.get_or_create_direct_channel(tests.uid('alice')), :'dm'::
 select tests.throws($$ select public.get_or_create_direct_channel(tests.uid('bob')) $$, '22023', 'cannot DM yourself');
 
 select tests.login('alice');
-insert into public.chat_messages (channel_id, sender_id, message_text)
-values (:'dm', tests.uid('bob'), 'Singles tomorrow 6am?');   -- tries to spoof Bob as the sender
+-- [Step 4] Only the content columns are insertable; the sender is always the caller.
+select tests.throws(format($$ insert into public.chat_messages (channel_id, sender_id, message_text)
+                              values (%L, tests.uid('bob'), 'Singles tomorrow 6am?') $$, :'dm'),
+                    '42501', 'cannot spoof the sender');
+insert into public.chat_messages (channel_id, message_text) values (:'dm', 'Singles tomorrow 6am?');
 select tests.eq((select sender_id from public.chat_messages where channel_id = :'dm'), tests.uid('alice'),
-                'sender is always the authenticated user (spoofing ignored)');
+                'sender is always the authenticated user');
 select tests.ok((select last_message_at is not null from public.chat_channels where id = :'dm'::uuid),
                 'channel last_message_at bumped for inbox ordering');
 
@@ -55,11 +58,12 @@ select tests.ok(true, 'users update their own read marker and mute');
 -- Club chat moderation
 -- -----------------------------------------------------------------------------
 select c.id as club_chat from public.chat_channels c where c.type = 'CLUB' and c.club_id = '40000000-0000-4000-a000-000000000001' \gset
-insert into public.chat_messages (id, channel_id, message_text)
-values ('60000000-0000-4000-a000-000000000001', :'club_chat', 'Anyone selling a used paddle?');
+insert into public.chat_messages (channel_id, message_text)
+values (:'club_chat', 'Anyone selling a used paddle?')
+returning id as paddle_msg \gset
 select tests.login('carlos');
-update public.chat_messages set deleted_at = now() where id = '60000000-0000-4000-a000-000000000001';
-select tests.eq((select deleted_by from public.chat_messages where id = '60000000-0000-4000-a000-000000000001'), tests.uid('carlos'),
+update public.chat_messages set deleted_at = now() where id = :'paddle_msg';
+select tests.eq((select deleted_by from public.chat_messages where id = :'paddle_msg'), tests.uid('carlos'),
                 'club admins can moderate (soft-delete) club chat');
 select tests.login('dave');
 select tests.eq((select count(*) from public.chat_messages where channel_id = :'club_chat')::int, 0,

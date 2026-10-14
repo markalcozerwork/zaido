@@ -281,6 +281,19 @@ export interface InboxOptions {
   /** Joins are spread out (reconnect storms hit the project-wide joins/s quota). */
   joinBatch?: number;
   joinIntervalMs?: number;
+  /** After a refused join, don't retry that topic for this long (doubling, capped). */
+  refusedBackoffMs?: number;
+  now?: () => number;
+}
+
+/**
+ * realtime-js reports both a refused join (the server's reason) and a dropped
+ * socket as CHANNEL_ERROR. Dropped sockets are rejoined by realtime-js itself;
+ * only a refusal means "not yours (any more)".
+ */
+export function isRefusedJoin(error: Error | undefined): boolean {
+  if (!error) return false;
+  return !/^(socket closed|channel error: (transport failure|connection lost))/.test(error.message);
 }
 
 export interface InboxSubscription {
@@ -300,7 +313,12 @@ export function subscribeToInbox(
   const maxGroup = opts.maxGroupTopics ?? 20;
   const joinBatch = opts.joinBatch ?? 5;
   const joinIntervalMs = opts.joinIntervalMs ?? 100;
+  const baseBackoff = opts.refusedBackoffMs ?? 30_000;
+  const now = opts.now ?? Date.now;
   const groups = new Map<string, TopicHandle>();
+  /** Refused topics: retry no earlier than `until`; `wait` doubles per refusal. */
+  const refused = new Map<string, { until: number; wait: number }>();
+  const timeouts = new Map<string, number>();
   let pending: string[] = [];
   let joinTimer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
@@ -331,12 +349,23 @@ export function subscribeToInbox(
           if (h.success) listener.onChannel(h.data);
         }
       },
-      onStatus(status) {
-        // Don't let supabase-js retry a refused join forever: drop it and let
-        // the next inbox fetch decide whether it belongs here.
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+      onStatus(status, error) {
+        if (status === "SUBSCRIBED") {
+          refused.delete(channelId);
+          timeouts.delete(channelId);
+          return;
+        }
+        const timedOutAgain = status === "TIMED_OUT" && (timeouts.get(channelId) ?? 0) + 1 >= 3;
+        if (status === "TIMED_OUT") timeouts.set(channelId, (timeouts.get(channelId) ?? 0) + 1);
+        // A refusal (or repeated timeouts): stop supabase-js retrying it, back
+        // off, and let the inbox check that one chat. Transport errors are left
+        // to realtime-js's own rejoin.
+        if ((status === "CHANNEL_ERROR" && isRefusedJoin(error)) || timedOutAgain) {
           groups.get(channelId)?.unsubscribe();
           groups.delete(channelId);
+          timeouts.delete(channelId);
+          const wait = Math.min((refused.get(channelId)?.wait ?? baseBackoff / 2) * 2, 10 * 60_000);
+          refused.set(channelId, { until: now() + wait, wait });
           listener.onTopicLost?.(channelId);
         }
       },
@@ -358,7 +387,9 @@ export function subscribeToInbox(
       if (stopped) return;
       // My own group topics don't count against what is left for me.
       const cap = Math.min(maxGroup, channelsAvailable(client) + groups.size);
-      const wanted = new Set(ranked.slice(0, Math.max(0, cap)));
+      const t = now();
+      const eligible = ranked.filter((id) => (refused.get(id)?.until ?? 0) <= t);
+      const wanted = new Set(eligible.slice(0, Math.max(0, cap)));
       for (const [id, handle] of groups) {
         if (!wanted.has(id)) {
           handle.unsubscribe();

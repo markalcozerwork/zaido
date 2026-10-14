@@ -226,3 +226,37 @@ describe("joinTyping", () => {
     t.stop();
   });
 });
+
+describe("review fixes: refused vs dropped group topics", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("a dropped socket keeps the topic (realtime-js rejoins); a refusal drops it and backs off", () => {
+    const { client, channels } = fakeClient();
+    let now = 0;
+    const l = {
+      onMessage: vi.fn(),
+      onInbox: vi.fn(),
+      onChannel: vi.fn(),
+      onResync: vi.fn(),
+      onTopicLost: vi.fn(),
+    };
+    const sub = subscribeToInbox(client, ME, l, { refusedBackoffMs: 30_000, now: () => now });
+    sub.setGroupChannels([CH]);
+    const ch = channels.get(chatTopic(CH))!;
+    ch.status!("CHANNEL_ERROR", new Error("socket closed: 1006"));
+    ch.status!("CHANNEL_ERROR", new Error("channel error: connection lost"));
+    expect(sub.liveGroupChannels()).toEqual([CH]);
+    ch.status!(
+      "CHANNEL_ERROR",
+      new Error("Unauthorized: You do not have permissions to read from this Channel topic"),
+    );
+    expect(sub.liveGroupChannels()).toEqual([]);
+    expect(l.onTopicLost).toHaveBeenCalledTimes(1);
+    sub.setGroupChannels([CH]);
+    expect(sub.liveGroupChannels()).toEqual([]); // backing off
+    now = 30_001;
+    sub.setGroupChannels([CH]);
+    expect(sub.liveGroupChannels()).toEqual([CH]);
+  });
+});

@@ -221,3 +221,49 @@ describe("chat media", () => {
     ]);
   });
 });
+
+describe("review fixes: media chunking", () => {
+  it("signs every path of a big page, 100 per Storage call", async () => {
+    const calls: number[] = [];
+    const storage: ChatStorage = {
+      from: () => ({
+        createSignedUrls: async (paths: string[]) => {
+          calls.push(paths.length);
+          return {
+            data: paths.map((p) => ({ path: p, signedUrl: `https://cdn/${p}`, error: null })),
+            error: null,
+          };
+        },
+        remove: async () => ({ data: [], error: null }),
+      }),
+    };
+    const paths = Array.from(
+      { length: 150 },
+      (_, i) => `${CH}/${ME}/${`00000000-0000-4000-a000-${String(i).padStart(12, "0")}`}.jpg`,
+    );
+    const res = await signChatMedia({ storage }, paths);
+    expect(calls).toEqual([100, 50]);
+    expect(res.ok && Object.values(res.data).every((u) => u !== null)).toBe(true);
+  });
+
+  it("purges in chunks and reports a run where Storage refused everything", async () => {
+    const paths = Array.from(
+      { length: 150 },
+      (_, i) => `${CH}/${ME}/${`00000000-0000-4000-a000-${String(i).padStart(12, "0")}`}.jpg`,
+    );
+    const removes: number[] = [];
+    const storage: ChatStorage = {
+      from: () => ({
+        createSignedUrls: async () => ({ data: [], error: null }),
+        remove: async (p: string[]) => {
+          removes.push(p.length);
+          return { data: null, error: { message: "service unavailable" } };
+        },
+      }),
+    };
+    const { client } = fakeClient([ok(paths)]);
+    const res = await purgeChatMedia(Object.assign(client, { storage }), { batch: 2_000 }, { retry });
+    expect(removes).toEqual([100, 50]);
+    expect(res).toMatchObject({ ok: false, error: { code: "RETRYABLE" } });
+  });
+});

@@ -257,7 +257,7 @@ export const reportMessageSchema = z.strictObject({
   note: z
     .string()
     .transform((s) => s.trim())
-    .refine((s) => s.length <= CHAT_LIMITS.reportNoteMax, {
+    .refine((s) => codePoints(s) <= CHAT_LIMITS.reportNoteMax, {
       error: `Keep the note under ${CHAT_LIMITS.reportNoteMax} characters.`,
     })
     .optional(),
@@ -460,14 +460,48 @@ export const initialConversation = (channelId: string): ConversationState => ({
 export const newerMessage = (a: ChatMessage | undefined, b: ChatMessage): ChatMessage =>
   a === undefined || b.rev >= a.rev ? b : a;
 
-function mergeMessages(state: ConversationState, incoming: readonly ChatMessage[]): ConversationState {
-  if (incoming.length === 0) return state;
+/** Postgres left(text, n): the first n characters (code points). */
+const snippetOf = (text: string | null): string | null =>
+  text === null ? null : [...text].slice(0, CHAT_LIMITS.snippetLength).join("");
+
+/**
+ * Replies embed a preview of the message they quote, and editing or deleting
+ * that message gives the reply no new rev. So whenever a quoted message comes
+ * in, refresh the preview inside every loaded reply to it (a moderated
+ * message must not live on in quotes).
+ */
+function refreshQuotes(messages: Record<string, ChatMessage>, changed: readonly ChatMessage[]): void {
+  const byId = new Map(changed.map((m) => [m.id, m]));
+  for (const [id, reply] of Object.entries(messages)) {
+    const quoted = reply.reply_to && byId.get(reply.reply_to.id);
+    if (!quoted || !reply.reply_to) continue;
+    const deleted = quoted.deleted_at !== null;
+    messages[id] = {
+      ...reply,
+      reply_to: {
+        ...reply.reply_to,
+        snippet: deleted ? null : snippetOf(quoted.text),
+        media_kind: deleted ? null : (quoted.media?.kind ?? null),
+        is_deleted: deleted,
+      },
+    };
+  }
+}
+
+function mergeMessages(
+  state: ConversationState,
+  incoming: readonly ChatMessage[],
+  opts: { quotesFrom?: readonly ChatMessage[] } = {},
+): ConversationState {
+  const quotes = opts.quotesFrom ?? incoming;
+  if (incoming.length === 0 && quotes.length === 0) return state;
   const messages = { ...state.messages };
   const sentKeys = new Set<string>();
   for (const m of incoming) {
     messages[m.id] = newerMessage(messages[m.id], m);
     if (m.client_id) sentKeys.add(m.client_id);
   }
+  refreshQuotes(messages, quotes);
   // A message the server now has is no longer pending.
   const outbox = sentKeys.size ? state.outbox.filter((o) => !sentKeys.has(o.client_id)) : state.outbox;
   return { ...state, messages, outbox };
@@ -510,7 +544,13 @@ export function applyOlderPage(state: ConversationState, page: MessagesPage): Co
  * moves to the last row's rev; once complete, to the snapshot's last_rev.
  */
 export function applySyncPage(state: ConversationState, page: MessagesPage): ConversationState {
-  const next = mergeMessages(state, page.messages);
+  // Changes to messages above the loaded history aren't shown out of context;
+  // loadOlder fetches them at their current rev. They still refresh quotes,
+  // and the cursor moves past them.
+  const inWindow = page.messages.filter(
+    (m) => state.messages[m.id] !== undefined || state.oldest_seq === null || m.seq >= state.oldest_seq,
+  );
+  const next = mergeMessages(state, inWindow, { quotesFrom: page.messages });
   const maxRev = page.messages.reduce((a, m) => Math.max(a, m.rev), state.cursor_rev ?? 0);
   return {
     ...next,
@@ -568,10 +608,16 @@ export const markSending = (state: ConversationState, clientId: string): Convers
   updateOutbox(state, clientId, (o) => ({ ...o, status: "sending", attempts: o.attempts + 1 }));
 
 /** The server accepted (or replayed) the message. */
-export const markSent = (state: ConversationState, message: ChatMessage): ConversationState =>
-  mergeMessages({ ...state, outbox: state.outbox.filter((o) => o.client_id !== message.client_id) }, [
-    message,
-  ]);
+/**
+ * The server accepted (or replayed) the message. The send result is built
+ * from the table row (no reply preview, maybe no sender name), so it never
+ * replaces a copy a sync already delivered at the same or a newer rev.
+ */
+export function markSent(state: ConversationState, message: ChatMessage): ConversationState {
+  const pending = { ...state, outbox: state.outbox.filter((o) => o.client_id !== message.client_id) };
+  const existing = state.messages[message.id];
+  return existing && existing.rev >= message.rev ? pending : mergeMessages(pending, [message]);
+}
 
 export const OUTBOX_BACKOFF = { baseMs: 1_000, maxMs: 30_000 } as const;
 
@@ -640,6 +686,31 @@ export function sortInbox(entries: readonly InboxEntry[]): InboxEntry[] {
 }
 
 /** Replace/insert fetched rows; drop channels that are now archived from the active list. */
+/**
+ * A fetched row may be older than what hints already told us (a refresh in
+ * flight while I read the chat, or a message arrived). Counters only move
+ * forward: keep the higher last_seq and last_read_seq.
+ */
+export function mergeInboxEntry(local: InboxEntry | undefined, fetched: InboxEntry): InboxEntry {
+  if (!local) return fetched;
+  const lastSeq = Math.max(local.last_seq, fetched.last_seq);
+  const lastRead = Math.max(local.last_read_seq, fetched.last_read_seq);
+  return {
+    ...fetched,
+    last_seq: lastSeq,
+    last_read_seq: lastRead,
+    unread_count: Math.max(lastSeq - lastRead, 0),
+    activity_at: local.activity_at > fetched.activity_at ? local.activity_at : fetched.activity_at,
+  };
+}
+
+/** Rows whose local state is newer than the fetched row (their preview needs another fetch). */
+export const behindLocal = (entries: readonly InboxEntry[], fetched: readonly InboxEntry[]): string[] => {
+  const byId = new Map(entries.map((e) => [e.channel_id, e]));
+  return fetched.filter((f) => (byId.get(f.channel_id)?.last_seq ?? 0) > f.last_seq).map((f) => f.channel_id);
+};
+
+/** Merge fetched rows in; drop channels that are now archived from the active list. */
 export function upsertInbox(
   entries: readonly InboxEntry[],
   fetched: readonly InboxEntry[],
@@ -648,7 +719,7 @@ export function upsertInbox(
   const byId = new Map(entries.map((e) => [e.channel_id, e]));
   for (const f of fetched) {
     if ((view === "active") === f.is_archived) byId.delete(f.channel_id);
-    else byId.set(f.channel_id, f);
+    else byId.set(f.channel_id, mergeInboxEntry(byId.get(f.channel_id), f));
   }
   return sortInbox([...byId.values()]);
 }
