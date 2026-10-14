@@ -63,7 +63,7 @@ erDiagram
 | `0800_chat` | `chat_channels`, `chat_participants`, `chat_messages`, membership sync, `get_or_create_direct_channel()` |
 | `0900_rls_policies` | Every table policy in one reviewable file + privilege hardening |
 | `0950_storage` | Buckets and object policies (avatars, venue/club media, receipts, chat media, credentials) |
-| `0990_realtime_and_jobs` | `supabase_realtime` publication and `pg_cron` jobs |
+| `0990_realtime_and_jobs` | `supabase_realtime` publication and `pg_cron` jobs (Step 4's `1100_chat_engine` takes the chat tables back out of the publication) |
 
 ---
 
@@ -189,10 +189,19 @@ Channel membership is **derived by triggers**, never self-service:
 | `DIRECT` | `get_or_create_direct_channel(other)` | the pair, stored as `(low, high)` behind a unique index, so two people never end up with duplicate DM threads |
 
 RLS on `chat_messages` is then simply "is the caller a participant" (a
-primary-key lookup), and Supabase Realtime applies the same policy per
-subscriber. Sender identity is forced to `auth.uid()`. Edits are allowed for
-15 minutes. Deletes are soft deletes that wipe the content. Club admins and
-event organisers can moderate.
+primary-key lookup). Sender identity is forced to `auth.uid()`. Edits are
+allowed for 15 minutes. Deletes are soft deletes that wipe the content. Club
+admins and event organisers can moderate.
+
+Step 4 ([04-chat-engine.md](04-chat-engine.md)) builds the engine on top:
+
+* per-chat `seq`/`rev` ordering and unread markers;
+* idempotent sends;
+* DMs that stay private until the first message;
+* blocks, reports and the media lifecycle;
+* live updates as Realtime **Broadcast** hints on private topics, instead of
+  Postgres Changes, whose per-subscriber RLS on every change doesn't scale
+  to club-sized chats.
 
 ---
 
@@ -285,6 +294,6 @@ development. Production must load the official PSA PSGC file.
 | 2 | Zod schemas generated against these enums and CHECK limits. Map SQLSTATEs (`23P01` slot taken, `23514` rule violated, `42501` forbidden, `40001` retry) to typed errors |
 | 3 | ✅ Booking server action, retries, Realtime **Broadcast** of busy ranges per court: `create_booking` RPC + `src/server/bookings` ([03-booking-engine.md](03-booking-engine.md)) |
 | 3 | ✅ Clinics block the coach's private bookings and vice versa: the `app.coach_commitments` ledger ([03-booking-engine.md §5](03-booking-engine.md#5-coaches-one-ledger-one-constraint)) |
-| 4 | Inbox RPC with unread counts (`last_read_at`), keyset pagination on `(channel_id, created_at, id)` |
+| 4 | ✅ Inbox RPC with unread counts and keyset pagination. Built on per-chat `seq`/`rev` instead of `created_at`, which misses late commits ([04-chat-engine.md §2–3](04-chat-engine.md#2-ordering-seq-and-rev)) |
 | 5 | Atomic `rotate_court()` RPC for the paddle queue (N off → back of line, next N on) |
-| Later | PSGC importer · coach reviews · tournament bracket matches · private-club join requests · DM block/report · account-deletion anonymisation (bookings are financial records and are retained) |
+| Later | PSGC importer · coach reviews · tournament bracket matches · private-club join requests · account-deletion anonymisation (bookings are financial records and are retained; chat messages keep their content without a sender) |
